@@ -1,2 +1,2 @@
-# Siberia_fire_size
-Code associated with the manuscript 'Fire characteristics of Siberian larch forests under climate change'
+# Siberia fire size
+Code associated with the manuscript 'Siberian larch fire regimes and climate change'
