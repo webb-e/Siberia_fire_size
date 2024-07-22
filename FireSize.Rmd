@@ -1,0 +1,3094 @@
+---
+title: "FireSize"
+author: "Elizabeth Webb"
+date: "Last compiled on `r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, eval=FALSE, python.reticulate = FALSE)
+```
+
+# Description of data files
+
+Scripts in this document rely on the following csv files, which are available on the corresponding github page.
+
+| csv file                           | output from                                       | input to                                                    | description                                                                                                                                                                                                                                       |
+|------------|------------|------------|-------------------------------------|
+| connectivity.csv                   | Forest connectivity                               | Variable means within each fire                             | Sum of the area of connected patches withinin each fire                                                                                                                                                                                           |
+| data_with_kmeans.csv               | Cluster analysis                                  | Statistical analysis; Figures 1, 2, 4, 5, 6; Tables 2 and 3 | Each row is an individual fire. Each column is an explanatory variable, fire characteristic (e.g., fire size or fire year), or landscape position (i.e., upland/lowland). **This is the main data used in further analysis.**                     |
+| firesize_and_variables_cleaned.csv | Variable means within each fire                   | Cluster analysis, Machine learning analysis                 | Each row is an individual fire. Each column is an explanatory variable or fire characteristic (e.g., fire size or fire year). This is the same data as 'data_with_kmeans.csv' except it does not include the results of the clustering algorithm. |
+| firesize_and_variables_final.csv   | GEE ('Variable means within each fire' script)    | Variable means within each fire                             | Fire-wise means of explanatory variables output from GEE. Requires post-processing before use in analysis.                                                                                                                                        |
+| pd_df.csv                          | Machine learning analysis                         | Figure 4                                                    | Partial dependence values from HBRT model.                                                                                                                                                                                                        |
+| regional_climate_means.csv         | GEE ('Regional means' script)                     | Table 2                                                     | Means of climate variables across the study region.                                                                                                                                                                                               |
+| size_groupedimportance_all.csv     | Machine learning analysis                         | Figure 3                                                    | Grouped importance values from HBRT model.                                                                                                                                                                                                        |
+| size_permimportance_all.csv        | Machine learning analysis                         | Figure 3                                                    | Permutation importance (individual variables) values from HBRT value.                                                                                                                                                                             |
+| topo_strat_100k                    | GEE ('Sample variables and random points' script) | Cluster analysis, Table 3                                   | Landscape variables extracted from 100,000 random points across the study region.                                                                                                                                                                 |
+
+# Data acquisition
+
+The weather, landscape, and fuel characteristics used in this analysis were procured from existing datasets. We used Google Earth Engine (GEE) to extract the relevant variables at each fire and across the study region. This section includes GEE scripts used to acquire each variable. To run properly, code must be copied and pasted into the GEE code editor.
+
+## Define study region
+
+```{js}
+///// THIS CODE DEFINES THE STUDY REGION
+
+//////////////
+/////// DEFINE PROJECTION AND SET YEAR
+//////////////
+var projection_ea = ee.Projection('PROJCS["Albers Conical Equal Area",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],TOWGS84[0,0,0,0,0,0,0],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9108"]],AUTHORITY["EPSG","4326"]],PROJECTION["Albers_Conic_Equal_Area"],PARAMETER["standard_parallel_1",50],PARAMETER["standard_parallel_2",70],PARAMETER["latitude_of_center",56],PARAMETER["longitude_of_center",100],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["meters",1]]').atScale(10000)
+
+//////////////
+/////// VARIABLES USED FOR MASKING
+//////////////
+///// LANDCOVER IN 2000 from ESA CCI
+var landcover = ee.Image("users/webbe/landcover/Landcover2000").rename('landcover').toInt();
+///// PF according to Obu et al., 2019
+var PF = ee.Image("users/webbe/Albedo/Permafrost");
+
+           
+  /// mask out non-larch and only in continuous PF zone
+      var studyregion = landcover.mask(landcover.select("landcover").eq(80))
+                                  .updateMask(PF.select('b1').lte(1))
+                                  .selfMask()
+
+  
+Map.addLayer(studyregion)
+
+
+
+Export.image.toAsset({
+  image: studyregion,
+  description: 'studyregion',
+  crs: 'EPSG:4326',
+  maxPixels:1e12,
+  scale: 300
+});
+
+
+```
+
+### Randomly sample study region
+
+```{js}
+//// This code generates 100,000 random samples from the study region
+
+var studyregion = ee.Image("users/ewebb/studyregion");
+
+var eurasia = ee.Geometry.Rectangle([180,50,0,80],null,false);
+
+var stratsample = studyregion.stratifiedSample({
+                      numPoints: 100000,
+                      classBand: "landcover", 
+                      seed: 100,
+                      region:eurasia,
+                      scale:300,
+                      geometries: true});
+
+Export.table.toAsset({
+        collection: stratsample,
+        description: 'studyregion_stratsample_100k'})
+
+```
+
+## Weather variables
+
+### Annual precipitation
+
+```{js}
+////////// THIS CODE CALCULATES THE SUM OF PRECIPITATION FROM
+////////// THE DAY OF SNOWMELT IN THE PREVIOUS YEAR (CALCULATED USING THE MODIS PRODUCT)
+////////// TO THE DAY OF SNOWMELT IN THE CURRENT YEAR (ALSO CALCULATED USING THE MODIS PRODUCT)
+////////// THE FILE 'precip_annual_2020' IS FROM SNOWMELT 2019 TO SNOWMELT 2020
+
+// SNOWMELT/SNOWONSET CODE NOT SHOWN; 
+// SEE: https://developers.google.com/earth-engine/tutorials/community/identifying-first-day-no-snow
+// FOR DETAILS ON SNOWMELT/SNOWONSET TIMING
+
+///// READ IN DATASETS
+var fire_img = ee.Image("users/ewebb/fire_img")
+var fire_coll = ee.FeatureCollection("users/ewebb/Siberia_fires");
+
+var snowmeltcollection = ee.ImageCollection("users/webbe/Surface_water/Snowmelt")
+var snow_melt = snowmeltcollection.toList(snowmeltcollection.size());
+
+var snowmonsetcollection = ee.ImageCollection("users/webbe/Surface_water/Snowonset")
+var snow_onset = snowmonsetcollection.toList(snowmonsetcollection.size());
+
+var exportscale = snowmonsetcollection.first().projection().nominalScale()
+var eurasia = ee.Geometry.Rectangle([180,50,0,80],null,false);
+
+///// CREATE FUNCTION TO EXTRACT PRECIPITATION DATA 
+var precipfun = function(year){
+          
+          var previousyear = ee.Number(year).subtract(2001)
+          var thisyear = ee.Number(year).subtract(2000)
+          
+          var start = ee.Date.fromYMD(ee.Number(year).subtract(1),1,1);
+          var end = start.advance(2, 'years')
+          var date_range = ee.DateRange(start,end);
+
+          
+          var precipdata = ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY")
+                            .filterBounds(eurasia)
+                            .filterDate(date_range)
+                            .filter(ee.Filter.calendarRange(0,0,'hour')) // only 0th hr (this is the daily accumulated total)
+          
+
+          var snow_thisyear = ee.Image(snow_melt.get(thisyear)).select('millis')
+          var snow_previousyear = ee.Image(snow_melt.get(previousyear)).select('millis')
+
+          var precipcollection = precipdata.map(function(image){
+                    var dateBand = ee.Image(image.date().millis());
+                    image = image.updateMask(dateBand.gte(snow_previousyear))
+                                  .updateMask(dateBand.lte(snow_thisyear));
+                    return image.select("total_precipitation") });
+
+
+          var precipsum = precipcollection.reduce(ee.Reducer.sum()).rename('precip_annual') 
+                                          .reproject({crs:'EPSG:4326', scale:exportscale}) 
+          
+            return precipsum }
+            
+            
+//RUN PRECIPIRATION FUNCTION; DO THIS SEPERATELY FOR EACH YEAR
+var cumulative_precip = precipfun(2001)
+
+Export.image.toAsset({
+  image: cumulative_precip,
+  description: 'precip_annual_2001',
+  assetId: 'precip_annual_2001',
+  region: eurasia,
+  scale: exportscale,
+  maxPixels: 1e12})
+
+```
+
+### Annual temperature
+
+```{js}
+////////// THIS CODE CALCULATES THE SUM OF TEMPERATURE FROM
+////////// THE DAY OF SNOWMELT IN THE PREVIOUS YEAR (CALCULATED USING THE MODIS PRODUCT)
+////////// TO THE DAY OF SNOWMELT IN THE CURRENT YEAR (ALSO CALCULATED USING THE MODIS PRODUCT)
+////////// THE FILE 'temp_annual_2020' IS FROM SNOWMELT 2019 TO SNOWMELT 2020
+
+// SNOWMELT/SNOWONSET CODE NOT SHOWN; 
+// SEE: https://developers.google.com/earth-engine/tutorials/community/identifying-first-day-no-snow
+// FOR DETAILS ON SNOWMELT/SNOWONSET TIMING
+
+///// READ IN DATASETS
+
+var fire_img = ee.Image("users/ewebb/fire_img")
+var fire_coll = ee.FeatureCollection("users/ewebb/Siberia_fires");
+
+var snowmeltcollection = ee.ImageCollection("users/webbe/Surface_water/Snowmelt")
+var snow_melt = snowmeltcollection.toList(snowmeltcollection.size());
+
+var snowmonsetcollection = ee.ImageCollection("users/webbe/Surface_water/Snowonset")
+var snow_onset = snowmonsetcollection.toList(snowmonsetcollection.size());
+
+var exportscale = snowmonsetcollection.first().projection().nominalScale()
+var eurasia = ee.Geometry.Rectangle([180,50,0,80],null,false);
+
+
+///// CREATE FUNCTION TO EXTRACT TEMPERATURE DATA 
+
+var tempfun = function(year){
+          
+          var previousyear = ee.Number(year).subtract(2001)
+          var thisyear = ee.Number(year).subtract(2000)
+          
+          var start = ee.Date.fromYMD(ee.Number(year).subtract(1),1,1);
+          var end = start.advance(2, 'years')
+          var date_range = ee.DateRange(start,end);
+          
+          var tempdata = ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY")
+                            .filterBounds(eurasia)
+                            .filterDate(date_range)
+  
+
+          var snow_thisyear = ee.Image(snow_melt.get(thisyear)).select('millis')
+          var snow_previousyear = ee.Image(snow_melt.get(previousyear)).select('millis')
+
+          var tempcollection = tempdata.map(function(image){
+                    var dateBand = ee.Image(image.date().millis());
+                    image = image.updateMask(dateBand.gte(snow_previousyear))
+                                  .updateMask(dateBand.lte(snow_thisyear));
+                    return image.select("temperature_2m").subtract(273.15) });
+
+
+          var tempsum = tempcollection.reduce(ee.Reducer.sum()).rename('temp_annual')
+                        .reproject({crs:'EPSG:4326', scale:exportscale}) 
+          
+          return tempsum }
+
+// RUN TEMPERATURE FUNCTION; DO THIS SEPERATELY FOR EACH YEAR
+
+var cumulative_temp = tempfun(2003)
+
+Export.image.toAsset({
+  image: cumulative_temp,
+  description: 'temp_annual_2003',
+  assetId: 'temp_annual_2003',
+  region: eurasia,
+  scale: exportscale,
+  maxPixels: 1e12})
+
+```
+
+### Summer precipitation
+
+```{js}
+////////// THIS CODE CALCULATES THE SUM OF PRECIPITATION FROM
+////////// THE DAY OF SNOWMELT (CALCULATED USING THE MODIS PRODUCT)
+////////// TO THE DAY OF SNOW-ON (ALSO CALCULATED USING THE MODIS PRODUCT) IN THE SAME YEAR
+////////// TO RUN PROPERLY, THIS CODE NEEDS TO BE RUN SEPERATELY FOR EACH YEAR
+
+// SNOWMELT/SNOWONSET CODE NOT SHOWN; 
+// SEE: https://developers.google.com/earth-engine/tutorials/community/identifying-first-day-no-snow
+// FOR DETAILS ON SNOWMELT/SNOWONSET TIMING
+
+///// READ IN DATASETS
+var fire_img = ee.Image("users/ewebb/fire_img")
+var fire_coll = ee.FeatureCollection("users/ewebb/Siberia_fires");
+
+var snowmeltcollection = ee.ImageCollection("users/webbe/Surface_water/Snowmelt")
+var snow_melt = snowmeltcollection.toList(snowmeltcollection.size());
+
+var snowmonsetcollection = ee.ImageCollection("users/webbe/Surface_water/Snowonset")
+var snow_onset = snowmonsetcollection.toList(snowmonsetcollection.size());
+
+var exportscale = snowmonsetcollection.first().projection().nominalScale()
+var eurasia = ee.Geometry.Rectangle([180,50,0,80],null,false);
+
+///// CREATE FUNCTION TO EXTRACT PRECIPITATION DATA 
+var precipfun = function(year){
+  
+          var index = ee.Number(year).subtract(2000)
+  
+          var start = ee.Date.fromYMD(year,1,1);
+          var end = ee.Date.fromYMD(year,12,31);
+          var date_range = ee.DateRange(start,end);
+          
+          var precipdata = ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY")
+                            .filterBounds(eurasia)
+                            .filterDate(date_range)
+                            .filter(ee.Filter.calendarRange(0,0,'hour')) // only 0th hr (this is the daily accumulated total)
+          
+          var snowmelt = ee.Image(snow_melt.get(index)).select('millis')
+          var snowonset = ee.Image(snow_onset.get(index)).select('millis')
+
+
+          var precipcollection = precipdata.map(function(image){
+                    var dateBand = ee.Image(image.date().millis());
+                    image = image.updateMask(dateBand.gte(snowmelt))
+                                  .updateMask(dateBand.lte(snowonset));
+                    return image.select("total_precipitation") });
+
+
+          var precipsum = precipcollection.reduce(ee.Reducer.sum()).rename('precip_snowoff')
+                                          .reproject({crs:'EPSG:4326', scale:exportscale}) 
+          
+          return precipsum }
+
+// RUN PRECIPITATION FUNCTION; DO THIS SEPERATELY FOR EACH YEAR
+var cumulative_precip = precipfun(2000)
+
+Export.image.toAsset({
+  image: cumulative_precip,
+  description: 'precip_snowoff_2000',
+  assetId: 'precip_snowoff_2000',
+  region: eurasia,
+  scale: exportscale,
+  maxPixels: 1e12})
+```
+
+### Summer temperature
+
+```{js}
+////////// THIS CODE CALCULATES THE SUM OF TEMPERATURE FROM
+////////// THE DAY OF SNOWMELT (CALCULATED USING THE MODIS PRODUCT)
+////////// TO THE DAY OF SNOW-ON (ALSO CALCULATED USING THE MODIS PRODUCT)
+////////// TO RUN PROPERLY, THIS CODE NEEDS TO BE RUN SEPERATELY FOR EACH YEAR
+
+// SNOWMELT/SNOWONSET CODE NOT SHOWN; 
+// SEE: https://developers.google.com/earth-engine/tutorials/community/identifying-first-day-no-snow
+// FOR DETAILS ON SNOWMELT/SNOWONSET TIMING
+
+///// READ IN DATASETS
+
+var fire_img = ee.Image("users/ewebb/fire_img")
+var fire_coll = ee.FeatureCollection("users/ewebb/Siberia_fires");
+
+var snowmeltcollection = ee.ImageCollection("users/webbe/Surface_water/Snowmelt")
+var snow_melt = snowmeltcollection.toList(snowmeltcollection.size());
+
+var snowmonsetcollection = ee.ImageCollection("users/webbe/Surface_water/Snowonset")
+var snow_onset = snowmonsetcollection.toList(snowmonsetcollection.size());
+
+var exportscale = snowmonsetcollection.first().projection().nominalScale()
+var eurasia = ee.Geometry.Rectangle([180,50,0,80],null,false);
+
+
+///// CREATE FUNCTION TO EXTRACT TEMPERATURE DATA 
+
+var tempfun = function(year){
+  
+          var index = ee.Number(year).subtract(2000)
+  
+          var start = ee.Date.fromYMD(year,1,1);
+          var end = ee.Date.fromYMD(year,12,31);
+          var date_range = ee.DateRange(start,end);
+          
+          var precipdata = ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY")
+                            .filterBounds(eurasia)
+                            .filterDate(date_range)
+                            
+
+          var snowmelt = ee.Image(snow_melt.get(index)).select('millis')
+          var snowonset = ee.Image(snow_onset.get(index)).select('millis')
+
+          var tempcollection = precipdata.map(function(image){
+                    var dateBand = ee.Image(image.date().millis());
+                    image = image.updateMask(dateBand.gte(snowmelt))
+                                  .updateMask(dateBand.lte(snowonset));
+                    return image.select("temperature_2m").subtract(273.15)});
+
+
+          var tempsum = tempcollection.reduce(ee.Reducer.sum()).rename('temp_snowoff')
+                                        .reproject({crs:'EPSG:4326', scale:exportscale})        
+
+          
+          return tempsum }
+
+// RUN PRECIPITATION FUNCTION; DO THIS SEPERATELY FOR EACH YEAR
+var cumulative_temp = tempfun(2020)
+
+Export.image.toAsset({
+  image: cumulative_temp,
+  description: 'temp_snowoff_2020',
+  assetId: 'temp_snowoff_2020',
+  region: eurasia,
+  scale: exportscale,
+  maxPixels: 1e12})
+```
+
+### Meltwater
+
+```{js}
+// #############################################################################
+// ### THIS CODE MAKES AN ASSET OF THE WATER IN SNOWMELT FOR THE PERIOD (2001-2020)
+// ###   NOTE THAT THE ERA MONTHLY DATA GIVES MELTOUT IN AVERAGE METERS OF SNOWMELT PER DAY
+// ###   THE HOURLY DATA GIVES MELTOUT IN ACCUMULATIONS PER DAY. HOUR ZERO IS THE TOTAL  
+// ###   ACCUMULATION FROM THE PREVIOUS DAY.  SEE https://confluence.ecmwf.int/display/CUSF/Total+Precipitation+%5BValues+not+in+range%5D+-+ERA5-Land+hourly+data+from+1981+to+present?desktop=true&macroName=view-file
+// ###   HERE I USE THE HOURLY DATA, AND FILTER TO ONLY SEE DAILY ACCUMULATIONS 
+// #############################################################################
+
+//////////
+///define variables
+//////////
+
+var eurasia = ee.Geometry.Rectangle([180,50,0,80],null,false);
+
+
+var meltdata = ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY")
+                .filter(ee.Filter.calendarRange(2001,2020,'year'))// only years 2000-2021
+                .filter(ee.Filter.calendarRange(1,7,'month'))// only Jan-July
+                .filter(ee.Filter.calendarRange(0,0,'hour')) // only 0th hr (this is the daily accumulated total)
+                .filterBounds(eurasia);
+var exportscale = meltdata.first().projection().nominalScale()
+
+//////////
+/// take hourly data from the entire year and average it
+//////////
+
+var meltfun = function(i){
+                var arctic =  meltdata
+                              .filter(ee.Filter.calendarRange(i,i,'year')) // only per year
+                              .map(function(img) { 
+                                      var arcticmelt = img.select("snowmelt")
+                                                      .clip(eurasia)
+                                      return arcticmelt ; })    
+
+                var pixelsum = arctic.reduce(ee.Reducer.sum())
+              return pixelsum};
+              
+var totalmelt = meltfun(2020)
+
+
+//////////
+/// Export each image
+//////////
+
+Export.image.toAsset({
+  image: totalmelt,
+  description: 'meltwater_2020',
+  maxPixels:1e12,
+  scale:exportscale,
+  region: eurasia
+});
+
+```
+
+### Anomolies
+
+```{js}
+//////// THIS CODE CALCULATES THE 20-YEAR MEAN OF EACH VARIABLE
+////////// AS WELL AS THE ANNUAL ANOMOLY FROM THAT MEAN
+
+///////// RUN SEPERATELY FOR EACH YEAR
+
+// import variables
+var meltwater = ee.ImageCollection("users/ewebb/meltwater_collection"),
+    precip_annual = ee.ImageCollection("users/ewebb/precip_annual_collection"),
+    precip_snowoff = ee.ImageCollection("users/ewebb/precip_snowoff_collection"),
+    temp_annual = ee.ImageCollection("users/ewebb/temp_annual_collection"),
+    temp_snowoff = ee.ImageCollection("users/ewebb/temp_snowoff_collection");
+
+/// set scale and region
+var exportscale = meltwater.first().projection().nominalScale()
+var eurasia = ee.Geometry.Rectangle([180,50,0,80],null,false);
+
+///// calculate 20 year mean of each variable
+var meltwatermean = meltwater.mean()
+var precip_annualmean = precip_annual.mean()
+var precip_snowoffmean = precip_snowoff.mean()
+var temp_annualmean = temp_annual.mean()
+var temp_snowoffmean = temp_snowoff.mean()
+
+// set up collections for mapping
+var meltwater = meltwater.toList(meltwater.size());
+var precip_annual = precip_annual.toList(precip_annual.size())
+var precip_snowoff = precip_snowoff.toList(precip_snowoff.size())
+var temp_annual = temp_annual.toList(temp_annual.size())
+var temp_snowoff = temp_snowoff.toList(temp_snowoff.size())
+
+////// calculate the anomoly
+
+var anomolyfun = function(year){
+  
+          var index = ee.Number(year).subtract(2001)
+          
+          var meltwater_anom = meltwatermean.subtract(ee.Image(meltwater.get(index)))
+          var precip_annual_anom = precip_annualmean.subtract(ee.Image(precip_annual.get(index)))
+          var precip_snowoff_anom = precip_snowoffmean.subtract(ee.Image(precip_snowoff.get(index)))
+          var temp_annual_anom = temp_annualmean.subtract(ee.Image(temp_annual.get(index)))
+          var temp_snowoff_anom = temp_snowoffmean.subtract(ee.Image(temp_snowoff.get(index)))
+          
+          var anomolies = meltwater_anom.rename('melt_anom')
+                          .addBands(precip_annual_anom.rename('precip_annual_anom'))
+                          .addBands(precip_snowoff_anom.rename('precip_snowoff_anom'))
+                          .addBands(temp_annual_anom.rename('temp_annual_anom'))
+                          .addBands(temp_snowoff_anom.rename('temp_snowoff_anom'))
+          return anomolies}
+          
+var all_anomolies = anomolyfun(2020)
+
+
+Export.image.toAsset({
+  image: all_anomolies,
+  description: 'anomolies_2020',
+  assetId: 'all_anomolies_2020',
+  region: eurasia,
+  scale: exportscale,
+  maxPixels: 1e12})
+```
+
+### VPD, CWD, PDSI, max air temp, soil moisture, wind
+
+#### VPD, etc. at each fire
+
+```{js}
+
+////////// THIS CODE EXTRACTS PDSI, VPD, WIND SPEED, TEMPERATURE
+////////// CLIMACTIC WATER DEFICIT, AND SOIL TEMPERATURE DURING THE MONTH
+//////////  OF FIRE AT EACH FIRE
+////////// TO RUN PROPERLY, THIS CODE NEEDS TO BE RUN SEPERATELY FOR EACH YEAR
+
+// help from:
+// https://gis.stackexchange.com/questions/351437/use-image-to-apply-unique-filterdate-range-for-each-pixel-in-an-imagecollection
+
+// IMPORT AND SET UP DATA
+var fire_shp = ee.FeatureCollection("users/ewebb/Siberia_fires");
+var fire_img_coll = ee.ImageCollection("users/ewebb/fire_img_collection");
+var firelist = fire_img_coll.toList(fire_img_coll.size());
+var dataset = ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+var eurasia = ee.Geometry.Rectangle([180,50,0,80],null,false);
+
+
+/// DEFINE FUNCTION TO EXTRACT CLIMATE DATA FROM FIRE PERIMETERS DURING MONTH OF FIRE
+var variablefun = function(year){
+          var index_fire = ee.Number(year).subtract(2001)
+
+          var start = ee.Date.fromYMD(year,1,1);
+          var end = ee.Date.fromYMD(year,12,31);
+          var date_range = ee.DateRange(start,end);
+          
+          var climatedata = ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+                            .filterBounds(eurasia)
+                            .filterDate(date_range)
+          var dayof_fire = ee.Image(firelist.get(index_fire)).select('FireDay')
+
+          var climatecollection = climatedata.map(function(image){
+                    var start = ee.Image.constant(image.get('system:time_start'))
+                    var end = ee.Image.constant(image.get('system:time_end'))
+                    var image = image.updateMask(dayof_fire.gte(start))
+                                  .updateMask(dayof_fire.lt(end));
+                    return image.select("pdsi", 'vs', 'vpd', 'def', 'tmnx', 'soil') });
+
+                 return climatecollection }
+          
+
+/// RUN SEPERATELY FOR EACH YEAR
+var climatevariables = variablefun(2020)
+var final = climatevariables.mosaic()
+
+Export.image.toAsset({
+  image: final,
+  description: 'climate_2020',
+  assetId: 'climate_2020',
+  region: eurasia,
+  scale: 500,
+  maxPixels: 1e12})
+  
+
+```
+
+#### VPD, etc. aross the region
+
+```{js}
+
+////////// THIS CODE EXTRACTS PDSI, VPD, WIND SPEED, TEMPERATURE
+////////// CLIMACTIC WATER DEFICIT, AND SOIL TEMPERATURE FOR THE
+////////// TO RUN PROPERLY, THIS CODE NEEDS TO BE RUN SEPERATELY FOR EACH YEAR
+
+
+// help from: // https://gis.stackexchange.com/questions/351437/use-image-to-apply-unique-filterdate-range-for-each-pixel-in-an-imagecollection
+
+// set up data
+var dataset = ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+var eurasia = ee.Geometry.Rectangle([180,50,0,80],null,false);
+
+// define function
+var variablefun = function(year){
+
+          var start = ee.Date.fromYMD(year,5,1);
+          var end = ee.Date.fromYMD(year,8,31);
+          var date_range = ee.DateRange(start,end);
+          
+          var climatedata = ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+                            .filterBounds(eurasia)
+                            .filterDate(date_range)
+                            .select("pdsi", 'vs', 'vpd', 'def', 'tmmx', 'soil')
+          
+          var meandat = climatedata.reduce(ee.Reducer.mean()).clip(eurasia)
+          
+          return meandat }
+          
+// map function to year; be sure to change for each year
+var climatevariables = variablefun(2020)
+
+
+Export.image.toAsset({
+  image: climatevariables,
+  description: 'regional_climate_2020',
+  assetId: 'regional_climate_2020',
+  region: eurasia,
+  scale: 4638.3,
+  maxPixels: 1e12})
+
+```
+
+## Topographic variables
+
+```{js}
+var all_fires = ee.FeatureCollection("users/ewebb/Siberia_fires");
+////////// THIS CODE CALCULATES SLOPE, ELEVATION, AND RUGGEDNESS OF 
+////////// FIRES IN SIBERIAN LARCH FORESTS
+////////// FROM DIGITAL ELEVATION MODELS OF THE NORTHERN PERMAFROST ZONE
+////////// THE CODE NEEDS TO BE RUN TWICE:
+////////// ONCE FOR THE ARCTIC DEM (ABOVE 60 DEG) AND
+////////// ONCE FOR THE NASA DEM (BELOW 60 DEG)
+
+/// polygon of Siberia (roughly)
+var siberia = ee.Geometry.Polygon(
+        [[[65.57917917782099, 76.25998080453323],
+          [65.57917917782099, 49.07141599659548],
+          [188.977616677821, 49.07141599659548],
+          [188.977616677821, 76.25998080453323]]], null, false);
+
+
+////////// THE TWO DEMS; COMMENT OUT THE ONE YOU'RE NOT RUNNING
+
+//var dem = ee.ImageCollection("UMN/PGC/ArcticDEM/V3/2m").mosaic()
+var dem = ee.Image('NASA/NASADEM_HGT/001');
+
+// Create the derived terrain layers
+var terrain = ee.Terrain.products(dem.reproject({crs:'EPSG:4326', scale:30}));
+
+// elevation
+var elevation = dem.select('elevation').round().toUint16();
+// slope
+var slppct = terrain.select(['slope'], ['SLPPCT']);
+// ruggedness
+var rug = elevation.subtract(elevation.focal_mean(4.5, 'square', 'pixels')).abs()
+  .rename('ruggedness').toFloat()
+
+/// all variables stacked
+var stackBands1 = elevation
+                  .addBands(slppct)
+                  .addBands(rug)
+                  
+// clip to only fires; otherwise collection is too large
+var final = stackBands1.clipToCollection(all_fires)
+
+Export.image.toAsset({
+  image: final,
+  description: 'topographic_variables',
+ // assetId: "projects/ee-webbe/assets/topo_variables_lower60",
+  crs: 'EPSG:4326',
+  region: sibera,
+  maxPixels:1e12,
+  scale: 30
+});
+
+```
+
+## Forest connectivity
+
+Note that this code exports directly to a csv (unlike other code, which exports to a GEE asset). This is because there are multiple files per year, and the data requires pre-processing in R before it can be combined with other GEE exports.
+
+```{js}
+//// This code creates a vector for each group of connected forested pixels within a fire
+//// and calculates the area of the connected pixels. First, we create a feature collection
+//// where each feature is a group of connected pixels and the property is the area of the group.
+//// Then, we add the fire ID as an additional property and export.
+
+//// To run properly, this code must be run seperately for each year. Most years need to be
+//// run in chunks of 250 (i.e., 250 fires at a time); see line 24
+
+///////////
+//// READ IN DATA
+///////////
+
+var fires = ee.FeatureCollection("users/ewebb/Siberia_fires")// fires from Talucci et al., 2022
+var treedata = ee.Image('UMD/hansen/global_forest_change_2022_v1_10').select('treecover2000')
+
+///////////
+//// GET CONNECTED PIXELS WITHIN A FIRE FOR EACH YEAR
+///////////
+var year = 2002
+
+var thisyearfires1 = fires.filter(ee.Filter.equals('FireYr',year))
+var size = thisyearfires1.size() 
+//////// may have to run this code in groups of 250 fires
+var thisyearfires = thisyearfires.toList(size).slice(0,250)
+
+var perimiters = ee.FeatureCollection(thisyearfires)
+
+/// define forest as >30% tree cover and clip to only fire perimiters
+var forests = treedata.gte(30).clipToCollection(perimiters).selfMask()
+
+// Get a pixel area image.
+var pixelArea = ee.Image.pixelArea();
+
+// images to turn into vector/reduce
+var finalimg = forests.addBands(pixelArea)
+
+///choose what happens at vectorization (i.e., which propoerties to add to each feature.
+/// here we choose the sum area of connected pixels)
+var reducer = ee.Reducer.sum()      // sum of pixel area
+              .setOutputs(['patch_area']);
+
+// vectorize connected pixels
+var connected = finalimg.reduceToVectors({
+                      geometry: perimiters,
+                      reducer: reducer,
+                      scale: 30,
+                      geometryType: 'polygon',
+                      eightConnected: true,
+                      maxPixels:1e12,
+                      labelProperty : null,
+                      geometryInNativeProjection: true
+                    });
+                    
+////////////
+////// IDENTIFY WHICH FIRE CONNECTED PIXELS BELONG TO
+///////////
+
+var intersectsFilter = ee.Filter.intersects({leftField: '.geo', rightField: '.geo'})
+
+function cleanJoin(feature){
+  return ee.Feature(feature.get('primary')).copyProperties(feature.get('secondary'))}
+
+var matches = ee.Join.inner().apply(connected, thisyearfires, intersectsFilter)
+              .map(cleanJoin)
+
+////////////
+////// EXPORT CONNECTED PIXELS
+///////////
+
+Export.table.toDrive({
+        collection: matches,
+        folder: 'forest_connecivity',
+        description: 'connectivity_2002_0to250',
+         // Specify what to export, to get cleaner result
+        selectors: [ 'patch_area', 'label', 'UniqueId', 'FireYr']})
+```
+
+## Export from GEE to CSV
+
+### Variable means within each fire
+
+```{js}
+//////////////
+///////THIS CODE EXPORTS DATA FROM GEE ASSETS AND PRODUCTS TO A CSV FILE;
+/////// FURTHER ANALYSIS IS CONDUCTED IN R AND PYTHON 
+/////////////
+
+
+var varifun = function(year){
+
+///////////// LOAD IN DATSETS
+var tree_cover = ee.Image('UMD/hansen/global_forest_change_2022_v1_10').select('treecover2000')
+var meanprecip = ee.Image("WORLDCLIM/V1/BIO").select("bio12").rename("ma_precip");
+var meantemp = ee.Image("WORLDCLIM/V1/BIO").select("bio01").rename("ma_temp");
+var topo_variables = ee.Image("projects/ee-webbe/assets/topo_variables")
+var topo_variables_low = ee.Image("projects/ee-webbe/assets/topo_variables_lower60");
+var soil_C  = ee.Image("projects/soilgrids-isric/soc_mean").select('soc_0-5cm_mean').rename('SOC_5cm')
+var org_fraction = ee.Image("projects/soilgrids-isric/ocd_mean").select('ocd_0-5cm_mean').rename('org_fraction')
+var sand = ee.Image("projects/soilgrids-isric/sand_mean").select('sand_0-5cm_mean').rename('sand')
+var pickens = ee.Image('projects/glad/water/dynamics21/classes')
+/// PF IS FROM OBU ET AL., 2019, which is an open dataset. 
+var PF = ee.Image("users/webbe/Albedo/Permafrost").rename('PF')
+/// FIRES ARE FROM TALUCCI ET AL., 2022, which is an open dataset
+var fires = ee.FeatureCollection("users/ewebb/Siberia_fires")
+var meltwater_collection = ee.ImageCollection("users/ewebb/meltwater_collection");
+var precip_annual_collection = ee.ImageCollection("users/ewebb/precip_annual_collection")
+var precip_snowoff_collection = ee.ImageCollection("users/ewebb/precip_snowoff_collection")
+var temp_snowoff_collection = ee.ImageCollection("users/ewebb/temp_snowoff_collection")
+var temp_annual_collection = ee.ImageCollection("users/ewebb/temp_annual_collection")
+// LANDCOVER IS FROM THE ESA CCI 2000 LANDCOVER MAP, which is an open dataset
+var landcover = ee.Image("users/webbe/landcover/Landcover2000").rename('landcover').toInt();
+var climate_collection = ee.ImageCollection("users/ewebb/climate_collection")
+var annomoly_collection = ee.ImageCollection("users/ewebb/anomoly_collection");
+
+
+// set projection
+var projection_ea = ee.Projection('PROJCS["Albers Conical Equal Area",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],TOWGS84[0,0,0,0,0,0,0],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9108"]],AUTHORITY["EPSG","4326"]],PROJECTION["Albers_Conic_Equal_Area"],PARAMETER["standard_parallel_1",50],PARAMETER["standard_parallel_2",70],PARAMETER["latitude_of_center",56],PARAMETER["longitude_of_center",100],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["meters",1]]').atScale(10000)
+
+// set index year
+var thisyear = ee.Number(year).subtract(2001)
+var fireyr = ee.Number(year).toInt();
+
+/////// PRE-PROCESSING OF SOME VARIABLES
+
+/// only want water to know about permanent water bodies or stable seasonal
+var water = pickens.neq(1).and(pickens.neq(10)).selfMask().rename('water')// not land and not probable permanent land
+
+//climate variables
+var climatecollection = climate_collection.toList(climate_collection.size());
+var climate_annual = ee.Image(climatecollection.get(thisyear))
+
+//anomoly collection
+var anomoly_collection = annomoly_collection.toList(annomoly_collection.size());
+var anomoly_annual= ee.Image(anomoly_collection.get(thisyear))
+
+/// precip_annual
+var precipannualcollection = precip_annual_collection.toList(precip_annual_collection.size());
+var precip_annual = ee.Image(precipannualcollection.get(thisyear)).rename('precip_annual')
+
+/// precip_summer
+var precipsnowoffcollection = precip_snowoff_collection.toList(precip_snowoff_collection.size());
+var precip_snowoff = ee.Image(precipsnowoffcollection.get(thisyear)).rename('precip_snowoff')
+
+/// temp_annual
+var temp_annualcollection = temp_annual_collection.toList(temp_annual_collection.size());
+var temp_annual = ee.Image(temp_annualcollection.get(thisyear)).rename('temp_annual')
+
+/// temp_summer
+var temp_snowoffcollection = temp_snowoff_collection.toList(temp_snowoff_collection.size());
+var temp_snowoff = ee.Image(temp_snowoffcollection.get(thisyear)).rename('temp_snowoff')
+
+/// meltwater
+var meltwatercollection = meltwater_collection.toList(meltwater_collection.size());
+var meltwater = ee.Image(meltwatercollection.get(thisyear)).rename('meltwater')
+
+/// larch presence
+var larch = landcover.mask(landcover.select("landcover").eq(80)).mask().selfMask()
+
+//////////////
+/////// CREATE ONE IMAGE FOR REDUCTION
+/////////////
+
+var all_images =  tree_cover.addBands(meanprecip)
+                            .addBands(meantemp)
+                            .addBands(topo_variables)
+                            .addBands(topo_variables_low)
+                            .addBands(org_fraction)
+                            .addBands(sand)
+                            .addBands(PF)
+                            .addBands(water)
+                            .addBands(precip_annual)
+                            .addBands(precip_snowoff)
+                            .addBands(temp_annual)
+                            .addBands(temp_snowoff)
+                            .addBands(meltwater)
+                            .addBands(larch)
+                            .addBands(climate_annual)
+                            .addBands(anomoly_annual)
+                            .addBands(ee.Image.pixelLonLat())
+                            
+//////////////
+/////// DEFINE REDUCERS
+/////////////
+                            
+var reducers = ee.Reducer.mean()
+                     .combine({
+                            reducer2: ee.Reducer.count().unweighted(),
+                              sharedInputs: true})
+                     .combine({
+                              reducer2: ee.Reducer.max(),
+                              sharedInputs: true  });
+
+//////////////
+/////// APPLY REDUCERS AND EXPORT
+/////////////
+                  
+
+var final_table = all_images.reduceRegions({
+                          collection: fires.filter(ee.Filter.equals('FireYr',fireyr)),
+                          scale: 30,
+                          crs: projection_ea,
+                          reducer:reducers})
+
+return final_table}
+                          
+var all_years = ee.List.sequence(2001, 2020, 1)
+var alltables = ee.FeatureCollection(all_years.map(varifun)).flatten()
+
+
+Export.table.toDrive({
+        collection: ee.FeatureCollection(alltables),
+        folder: 'BA_output',
+        description: 'firesize_variables_final'})
+
+
+```
+
+### Regional means
+
+```{js}
+///// This code exports annual regional means of climate variables
+
+//////////////
+/////// READ IN DATA
+/////////////
+
+var studyregion = ee.Image("users/ewebb/studyregion");
+var meltwater_collection = ee.ImageCollection("users/ewebb/meltwater_collection");
+var precip_annual_collection = ee.ImageCollection("users/ewebb/precip_annual_collection")
+var precip_snowoff_collection = ee.ImageCollection("users/ewebb/precip_snowoff_collection")
+var temp_snowoff_collection = ee.ImageCollection("users/ewebb/temp_snowoff_collection")
+var temp_annual_collection = ee.ImageCollection("users/ewebb/temp_annual_collection")
+var temp_fireyr_collection = ee.ImageCollection("users/ewebb/temp_fireyr_collection")
+var precip_fireyr_collection = ee.ImageCollection("users/ewebb/precip_fireyr_collection")
+var climate_collection = ee.ImageCollection("users/ewebb/regional_climate_collection")
+var annomoly_collection = ee.ImageCollection("users/ewebb/anomoly_collection");
+
+var projection_ea = ee.Projection('PROJCS["Albers Conical Equal Area",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],TOWGS84[0,0,0,0,0,0,0],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9108"]],AUTHORITY["EPSG","4326"]],PROJECTION["Albers_Conic_Equal_Area"],PARAMETER["standard_parallel_1",50],PARAMETER["standard_parallel_2",70],PARAMETER["latitude_of_center",56],PARAMETER["longitude_of_center",100],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["meters",1]]').atScale(10000)
+
+//////////////
+/////// DEFINE FUNCTION FOR PRE-PROCESSING OF SOME VARIABLES
+/////////////
+
+var varifun = function(year){
+        var thisyear = ee.Number(year).subtract(2001)
+        //////////////
+        /////// PRE-PROCESSING OF SOME VARIABLES
+        /////////////
+        
+        //climate variables
+        var climatecollection = climate_collection.toList(climate_collection.size());
+        var climate_annual = ee.Image(climatecollection.get(thisyear))
+        
+        //anomoly collection
+        var anomoly_collection = annomoly_collection.toList(annomoly_collection.size());
+        var anomoly_annual= ee.Image(anomoly_collection.get(thisyear))
+        
+        
+        /// precip_annual
+        var precipannualcollection = precip_annual_collection.toList(precip_annual_collection.size());
+        var precip_annual = ee.Image(precipannualcollection.get(thisyear)).rename('precip_annual')
+        
+        /// precip_snowoff
+        var precipsnowoffcollection = precip_snowoff_collection.toList(precip_snowoff_collection.size());
+        var precip_snowoff = ee.Image(precipsnowoffcollection.get(thisyear)).rename('precip_snowoff')
+        
+        /// precip_fireyr
+        var precip_fireyrcollection = precip_fireyr_collection.toList(precip_fireyr_collection.size());
+        var precip_fireyr = ee.Image(precip_fireyrcollection.get(thisyear)).rename('precip_fireyr')
+        
+        /// temp_annual
+        var temp_annualcollection = temp_annual_collection.toList(temp_annual_collection.size());
+        var temp_annual = ee.Image(temp_annualcollection.get(thisyear)).rename('temp_annual')
+        
+        /// temp_snowoff
+        var temp_snowoffcollection = temp_snowoff_collection.toList(temp_snowoff_collection.size());
+        var temp_snowoff = ee.Image(temp_snowoffcollection.get(thisyear)).rename('temp_snowoff')
+        
+        /// temp_fireyr
+        var temp_fireyrcollection = temp_fireyr_collection.toList(temp_fireyr_collection.size());
+        var temp_fireyr = ee.Image(temp_fireyrcollection.get(thisyear)).rename('temp_fireyr')
+        
+        /// meltwater
+        var meltwatercollection = meltwater_collection.toList(meltwater_collection.size());
+        var meltwater = ee.Image(meltwatercollection.get(thisyear)).rename('meltwater')
+        
+        
+//////////////
+/////// CREATE ONE IMAGE FOR REDUCTION
+/////////////
+        
+        var all_images = precip_annual.addBands(precip_snowoff)
+                                    .addBands(temp_annual)
+                                    .addBands(temp_snowoff)
+                                    .addBands(climate_annual)
+                                    .updateMask(studyregion)
+        var bands = all_images.bandNames()
+        var list = bands.map(function(n) { return all_images.select([n]) })
+        var mycollection = ee.ImageCollection.fromImages(list)
+        
+//////////////
+/////// APPLY REDUCERS AND EXPORT
+/////////////
+                          
+        var results = mycollection.map(function (image) {
+                        var reduction = image.reduceRegion({
+                            reducer: ee.Reducer.mean(),
+                            maxPixels: 1e12,
+                            scale: 300});
+                        // Attach the reduction results and month as properties to the features.
+                        return image.setMulti(reduction)
+                          .set('year', year);
+                      })
+                      
+      return results }
+
+
+var all_years = ee.List.sequence(2001, 2020, 1)
+var alltables = ee.FeatureCollection(all_years.map(varifun)).flatten()
+
+Export.table.toDrive({
+        collection: alltables,
+        selectors: ['year', 'precip_annual', 'precip_snowoff', 'temp_annual', 
+        'temp_snowoff',  'pdsi_mean', 'vs_mean', 'vpd_mean',
+        'def_mean', 'tmmx_mean', 'soil_mean'],
+        description: 'regional_climate_means'})
+                            
+```
+
+### Sample variables at random points
+
+```{js}
+///// This code takes 100,000 random points from across the study region
+///// and extracts landscape and topographic variables at those points.
+
+//// //// //// //// 
+//// read in data
+//// //// //// //// 
+
+var studyregion = ee.Image("users/ewebb/studyregion");
+var stratsample = ee.FeatureCollection("users/ewebb/studyregion_stratsample_100k");
+
+
+var tree_cover = ee.Image('UMD/hansen/global_forest_change_2022_v1_10').select('treecover2000').rename('treecover')
+var meanprecip = ee.Image("WORLDCLIM/V1/BIO").select("bio12").rename("ma_precip");
+var meantemp = ee.Image("WORLDCLIM/V1/BIO").select("bio01").rename("ma_temp");
+var org_fraction = ee.Image("projects/soilgrids-isric/ocd_mean").select('ocd_0-5cm_mean').rename('org_fraction')
+var sand = ee.Image("projects/soilgrids-isric/sand_mean").select('sand_0-5cm_mean').rename('sand')
+ 
+var projection_ea = ee.Projection('PROJCS["Albers Conical Equal Area",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],TOWGS84[0,0,0,0,0,0,0],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9108"]],AUTHORITY["EPSG","4326"]],PROJECTION["Albers_Conic_Equal_Area"],PARAMETER["standard_parallel_1",50],PARAMETER["standard_parallel_2",70],PARAMETER["latitude_of_center",56],PARAMETER["longitude_of_center",100],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["meters",1]]').atScale(10000)
+var eurasia = ee.Geometry.Rectangle([180,50,0,80],null,false);
+
+var arcticdem = ee.ImageCollection("UMN/PGC/ArcticDEM/V3/2m")
+                        .filterBounds(eurasia)
+                        .mosaic()
+
+var arcticdem = arcticdem.mask(arcticdem.select('matchtag').gte(1))                        
+
+var nasadem = ee.Image('NASA/NASADEM_HGT/001')
+
+//// //// //// //// 
+//// Create the derived terrain layers
+//// (need to do once for Arctic DEM (>60 N) and another time for NASA DEM (<60 N))
+//// //// //// //// 
+
+var terrain_arctic = ee.Terrain.products(arcticdem.reproject({crs:'EPSG:4326', scale:30}));
+var terrain_nasa = ee.Terrain.products(nasadem.reproject({crs:'EPSG:4326', scale:30}));
+
+
+// Create topography variables 
+var elevation_arctic = arcticdem.select('elevation').round().toUint16();
+var elevation_nasa = nasadem.select('elevation').round().toUint16();
+
+var slppct_arctic = terrain_arctic.select(['slope'], ['SLPPCT']);
+var slppct_nasa = terrain_nasa.select(['slope'], ['SLPPCT']);
+
+var rug_arctic = elevation_arctic.subtract(elevation_arctic.focal_mean(4.5, 'square', 'pixels')).abs()
+                    .rename('ruggedness').toFloat()
+var rug_nasa = elevation_nasa.subtract(elevation_nasa.focal_mean(4.5, 'square', 'pixels')).abs()
+                    .rename('ruggedness').toFloat()                    
+
+// Stack bands for sampling 
+var arcticbands = elevation_arctic
+                    .addBands(slppct_arctic)
+                    .addBands(rug_arctic)
+
+var nasabands = elevation_nasa
+                .addBands(slppct_nasa)
+                .addBands(rug_nasa)
+
+//// //// //// //// 
+//// Add other variables and define the extraction function
+//// //// //// //// 
+
+var everything = ee.ImageCollection([arcticbands,nasabands]).mosaic()
+                    .addBands(tree_cover)
+                    .addBands(meanprecip)
+                     .addBands(meantemp)
+                     .addBands(sand)
+                    .addBands(org_fraction)
+
+
+var extractValuesfun = function(feat) {
+    var geom = feat.geometry()
+    var newf = ee.Feature(feat)
+    var bands = everything.bandNames();
+    var values = everything.select(bands)
+                  .reduceRegion(ee.Reducer.first(), geom, 30);
+      
+      var fun = function(bandname, f) {
+            var f = ee.Feature(f);
+            var val = values.get(bandname);
+            var eek = f.set(bandname,val);
+            return ee.Feature(ee.Algorithms.If(ee.Algorithms.IsEqual(val, null),
+                           f.set(bandname, ee.String("NA")),
+                           f.set(bandname, ee.Number(val))
+                           ))
+         }
+     return ee.Feature(bands.iterate(fun, newf)) 
+ };
+  
+//// //// //// //// 
+//// Extract variables and export data
+//// //// //// ////   
+  
+var finaldata = stratsample.map(extractValuesfun);
+
+
+Export.table.toDrive({
+collection: finaldata,
+description: 'topo_strat_100k',
+fileFormat: 'CSV',
+folder: "random_sample" });
+
+```
+
+# Data post-processing
+
+## Forest connectivity
+
+There are a lot of csvs with information about connected pixels exported from GEE for each year. This code cleans up the data and exports it so it can be combined with other GEE outputs (see next script).
+
+```{r}
+library(tidyverse)
+
+##########
+#### SET WORKING DRIVE TO FOLDER WITH GOOGLE EARTH ENGINE CSV EXPORTS
+#### AND MAKE A LIST OF ALL THE CSVS
+##########
+
+setwd("/forest_connectivity")
+
+csv_names <- list.files(pattern = "*.csv",
+                        full.names = TRUE)
+
+##########
+######## READ IN AND CLEAN DATA
+##########
+
+df <- lapply(csv_names, read_csv) %>% ## read in csv
+            plyr::rbind.fill()  %>%  ## combine each csv/ dataframe by row
+            mutate(patch_area = as.numeric(patch_area),
+                   patch_hectare = patch_area*0.0001) %>%  ## convert from m2 to hectare2 to keep consistent w/the Talucci data
+            group_by(UniqueId) %>% ## for each fire,
+            summarize(sum_patch_area = sum(patch_hectare, na.rm=TRUE))  ## sum the area of connected patches
+
+##########
+######## EXPORT CLEANED DATA
+##########
+
+write.csv(df, "data/connectivity.csv", row.names = FALSE)
+
+```
+
+## Variable means within each fire
+
+Data exported from GEE are messy and need to be cleaned up for further analysis. This code does that.
+
+```{r}
+library(tidyverse)
+library(plyr)
+
+##########
+######## SET WORKING DRIVE AND READ IN DATA
+##########
+
+setwd("data/")
+
+### exported variables from Google Earth Engine
+  dat_orig<- read.csv("firesize_variables_final.csv")
+
+### post-processed forest connectivity file
+  mesh_all<-read.csv('connectivity.csv')
+
+##########
+######## CLEAN AND POST-PROCESS DATA
+##########
+
+## percent larch w/in fire 
+  dat_orig$larch_percent<-dat_orig$landcover_count/dat_orig$longitude_count
+## percent water w/in fire
+  dat_orig$water_percent <-dat_orig$water_count/dat_orig$longitude_count
+
+## filter to only include fires with >10% larch presence
+  df<- dat_orig %>% filter(larch_percent>0.1 & PF_max<=1)
+
+## fires <60N will show NA for topo variables since the lower latitude topo variables 
+## are derived from a different DEM. This code makes sure each fire has topo variables associated with it
+  df$elevation_mean <- ifelse(is.na(df$elevation_mean),df$elevation_1_mean, df$elevation_mean)
+  df$aspect_mean <- ifelse(is.na(df$aspect_mean),df$aspect_1_mean, df$aspect_mean)
+  df$SLPPCT_mean <- ifelse(is.na(df$SLPPCT_mean),df$SLPPCT_1_mean, df$SLPPCT_mean)
+  df$ASPTR_mean <- ifelse(is.na(df$ASPTR_mean),df$ASPTR_1_mean, df$ASPTR_mean)
+  df$ruggedness_mean <- ifelse(is.na(df$ruggedness_mean),df$ruggedness_1_mean, df$ruggedness_mean)
+
+### select only desired columns
+## see here for a description of the fire columns:
+## https://arcticdata.io/catalog/view/doi%3A10.18739%2FA2GB1XJ4M
+
+mid_df<- df %>% dplyr::select (c(UniqueId, SizeHa, EcoName, ArcSub, MinDay, MaxDay, TotDays,FireYr,
+                           ASPTR_mean, SLPPCT_mean,aspect_mean,
+                           elevation_mean, larch_percent, latitude_max,ma_precip_mean,
+                           ma_temp_mean, meltwater_mean, org_fraction_mean, precip_annual_mean,
+                           precip_snowoff_mean, ruggedness_mean, sand_mean,
+                           temp_annual_mean, temp_snowoff_mean,treecover2000_mean,
+                           water_percent, vpd_mean, vs_mean, pdsi_mean, def_mean,  soil_mean,
+                          tmmx_mean, temp_annual_anom_mean, temp_snowoff_anom_mean, 
+                          melt_anom_mean, precip_annual_anom_mean, 
+                          precip_snowoff_anom_mean)) %>%
+                dplyr::rename(ASPTR=ASPTR_mean,
+                       SLPPCT = SLPPCT_mean,
+                       aspect = aspect_mean,
+                       elevation = elevation_mean,
+                       latitude = latitude_max,
+                       ma_precip = ma_precip_mean,
+                       ma_temp = ma_temp_mean,
+                       meltwater = meltwater_mean,
+                       org_fraction = org_fraction_mean,
+                       precip_annual = precip_annual_mean,
+                       precip_snowoff = precip_snowoff_mean,
+                       ruggedness= ruggedness_mean,
+                       sand = sand_mean,
+                       soiltemp = soil_mean,
+                       temp_annual = temp_annual_mean,
+                       temp_snowoff = temp_snowoff_mean, 
+                       temp_max = tmmx_mean,
+                       treecover = treecover2000_mean,
+                       vpd = vpd_mean, 
+                       wind = vs_mean, 
+                       pdsi = pdsi_mean, 
+                       cwd = def_mean,
+                       temp_annual_anom = temp_annual_anom_mean,
+                       temp_snowoff_anom = temp_snowoff_anom_mean,
+                       melt_anom = melt_anom_mean,
+                       precip_annual_anom = precip_annual_anom_mean,
+                       precip_snowoff_anom = precip_snowoff_anom_mean)
+
+##########
+######## add in forest connectivity column
+##########
+
+## change names of effective mesh size columns
+
+colnames(mesh_all)<-c("UniqueId", "area_connect")
+
+
+combinedfiles<-join_all(list(mid_df, mesh_all), by='UniqueId', type='left')
+
+combinedfiles$connected<- combinedfiles$area_connect/combinedfiles$SizeHa
+
+##########
+######## write to csv
+##########
+
+write.csv(combinedfiles, "firesize_and_variables_cleaned.csv", row.names=FALSE)
+
+```
+
+# Data analysis
+
+## Cluster analysis
+
+This code runs the clustering algorithm and also produces Table 3
+
+```{r}
+##### This code runs the k-means clustering algorithm to
+##### (1) group fire data into clusters and 
+##### (2) determine the relative abundance of these clusters on the landscape
+##### It also creates a table with the landscape properties that characterisz
+##### each of these clusters
+
+library(tidyverse)
+library(fdm2id)
+library(factoextra)
+
+#############
+##### read in data
+#############
+
+## fire data
+firedat<- read.csv("firesize_and_variables_cleaned.csv")
+
+## randomly sampled data
+topodat<- read.csv("topo_strat_100k.csv")
+
+#############
+##### prepare data
+#############
+
+### select topo variables
+fireunscaled<-firedat %>% dplyr::select(elevation, ruggedness,SLPPCT,
+                                    treecover, org_fraction, sand,
+                                    UniqueId) %>% drop_na()
+
+topounscaled<-topodat  %>% dplyr::select(elevation, ruggedness,SLPPCT,
+                                        treecover, org_fraction, sand) %>% 
+                          drop_na()
+
+## scale data
+firescaled<-scale(fireunscaled %>% select(-UniqueId))
+toposcaled<-scale(topounscaled)
+
+
+#############
+##### run clustering
+#############
+
+## determine best number of clusters (2)
+fviz_nbclust(firescaled, kmeans, method = "silhouette")
+
+## run k-means  
+k.means<-KMEANS(firescaled, k=2, nstart=25)
+
+## predict k-means on randomly selected points 
+predict.kmeans <- getFromNamespace("predict.kmeans", "fdm2id")
+
+## add clusters to original data
+topounscaled$cluster <-predict.kmeans(k.means,toposcaled)
+
+fireunscaled$cluster<-k.means$cluster
+
+fire_final<-left_join(firedat,fireunscaled %>% select(UniqueId, cluster))
+
+
+####  write to CSV for further analysis
+write.csv(fire_final, "data_with_kmeans.csv",
+          row.names = FALSE)
+
+
+#############
+##### create table
+#############
+
+### select data to summarize
+
+fire_final<-dplyr::rename(fire_final, `% larch pixels in fire` = larch_percent,
+                `% water pixels in fire` = water_percent,
+                `soil carbon density`= org_fraction,
+                `% slope` = SLPPCT, 
+                `fire size (ha)` = SizeHa,
+                `elevation (m)`= elevation,
+                `% tree canopy cover` = treecover)
+
+firetable<-fire_final %>% dplyr::select(`% larch pixels in fire`,
+                                      `% water pixels in fire`,
+                                      `soil carbon density`,
+                                      `fire size (ha)`,
+                                       `% tree canopy cover`,
+                                      `elevation (m)`,ruggedness,
+                                     `% slope`, cluster)  %>%
+                      drop_na(cluster) %>%
+                      group_by(cluster) %>%
+                      summarize(
+                        "number of fires" = n(),
+                        "burned area (ha)" = sum(`fire size (ha)`),
+                        across(everything(), 
+                                       .f = list(mean = mean,
+                                                 stdev = sd), na.rm = TRUE),
+                        count= n()) %>% 
+               mutate( `percentage of fires` = 100*count / sum(count),
+                       `percentage of burned area`= 100*`burned area (ha)`/sum(`burned area (ha)`))%>%
+                select(-count) %>%
+                gather(key = key, value = value, -cluster) %>% 
+                separate(key, into = c("type", "stat"), sep = "_") %>% 
+                drop_na(value, type)%>%
+                spread(key = stat, value = value) %>% 
+                mutate(mean_w_sd = if_else(is.na(stdev),
+                                          as.character(round(`<NA>`,0)),
+                                          paste0(signif(mean, pmax(1,trunc(log10(mean)+1))), " ", 
+                                                 intToUtf8("177"), " ",
+                                          signif(stdev, pmax(1,trunc(log10(stdev)+1)))))) %>% 
+                mutate(mean_w_sd = prettyNum(mean_w_sd,big.mark=",", preserve.width="none")) %>%
+                 select(cluster, type, mean_w_sd) %>% 
+                spread(key = cluster, value = mean_w_sd) %>%
+                slice(match(c("burned area (ha)", 
+                              "percentage of burned area",
+                              "number of fires",
+                              "percentage of fires",
+                              "percentage of burned area that reburned",
+                              "fire size (ha)",
+                               "% slope", "ruggedness","elevation (m)", "soil carbon density",
+                              "% tree canopy cover","% larch pixels in fire",
+                              "% water pixels in fire"), type)) %>% 
+              rename(" " = type,
+                     'upland' ="1",
+                     'lowland' ="2")
+
+topotable<-topounscaled %>% group_by(cluster) %>%
+            summarize(count= n()) %>% 
+            mutate( `percentage of study region` = round(100*count / sum(count,0))) %>%
+            select(-count) %>% pivot_longer(cols=`percentage of study region`) %>%
+           spread(key=cluster, value=value) %>%
+            rename(" " = name,
+                   'upland' ="1",
+                   'lowland' ="2")
+          
+
+finaltable<-rbind(as.data.frame(topotable),
+                  as.data.frame(firetable))
+
+write.csv(finaltable, "cluster_table.csv",
+          row.names = FALSE)
+
+```
+
+## Statistical analysis
+
+This code runs basic statistical tests of temporal trends in burn area, fire size, and number of fires by landscape position (upland/lowland). It also summarizes the range of burn area over the study period and the correlation between annual burned area, mean fire size, and fire number
+
+```{r}
+library(lmtest)
+library(MASS)
+library(tidyverse)
+
+######
+### READ AND SUMMARIZE DATA
+#####
+firedat<- read.csv("data_with_kmeans.csv")
+
+### determine the number of fires and total burn area
+### for each year and for each cluster
+
+statdat <- firedat %>% mutate(cluster = as.character(cluster)) %>%
+            bind_rows(firedat %>% mutate(cluster = as.character("all"))) %>%
+            group_by(FireYr, cluster) %>% summarise(mean_size = mean(SizeHa),
+                                                    num_fires = n(),
+                                                    BA = sum(SizeHa))
+
+######
+### SOME STATS REGARDING SIGNIFICANCE OF TRENDS OVER TIME
+#####
+
+######
+### FIRE SIZE
+#####
+## ENTIRE STUDY REGION 
+size_all_model<- lm(log(mean_size)~FireYr,data=statdat[statdat$cluster=='all',])
+
+plot(size_all_model)
+
+    ## p-value
+    summary(size_all_model)$coefficients[1,4]  # p-value = 0.11
+```
+
+```{r}
+
+## UPLAND 
+size_up_model<- lm(log(mean_size)~FireYr,data=statdat[statdat$cluster=='1',])
+    
+plot(size_up_model)
+
+    ## p-value
+summary(size_up_model)$coefficients[1,4]  # p-value = 0.346861
+```
+
+```{r}
+## LOWLAND 
+    size_low_model<- lm(log(mean_size)~FireYr,data=statdat[statdat$cluster=='2',])
+    
+plot(size_low_model)
+    ## p-value
+    summary(size_low_model)$coefficients[1,4]  # p-value = 0.25
+```
+
+```{r}
+######
+### NUMBER OF FIRES
+#####
+    ## ENTIRE STUDY REGION 
+    n_all_model<- lm(log(num_fires)~FireYr,data=statdat[statdat$cluster=='all',])
+    
+    plot(n_all_model)
+    
+    ## p-value
+    summary(n_all_model)$coefficients[1,4]  # p-value = 0.218321
+```
+
+```{r}
+    ## UPLAND 
+    n_up_model<- lm(log(num_fires)~FireYr,data=statdat[statdat$cluster=='1',])
+plot(n_up_model)
+    
+    ## p-value
+    summary(n_up_model)$coefficients[1,4]  # p-value = 0.3565247
+```
+
+```{r}
+    ## LOWLAND 
+    n_low_model<- lm(log(num_fires)~FireYr,data=statdat[statdat$cluster=='2',])
+    
+plot(n_low_model)
+    
+    ## p-value
+    summary(n_low_model)$coefficients[1,4]  # p-value = 0.2571452 
+```
+
+```{r}
+######
+### BURNED AREA
+####
+    
+    statdat$sqrtBA<-sqrt(statdat$BA)
+    ## ENTIRE STUDY REGION 
+    BA_all_model<- lm(sqrtBA~FireYr,data=statdat[statdat$cluster=='all',])
+    
+plot(BA_all_model)
+    
+    ## p-value
+    summary(BA_all_model)$coefficients[1,4]  # p-value = 0.08723271
+    
+```
+
+```{r}
+    ## UPLAND 
+    BA_up_model<- lm(sqrtBA~FireYr,data=statdat[statdat$cluster=='1',])
+    
+plot(BA_up_model)
+    ## p-value
+    summary(BA_up_model)$coefficients[1,4]  # p-value = 0.18
+```
+
+```{r}
+    ## LOWLAND 
+    BA_low_model<- lm(sqrtBA~FireYr,data=statdat[statdat$cluster=='2',])
+    
+plot(BA_low_model)
+    
+    ## p-value
+    summary(BA_low_model)$coefficients[1,4]  # p-value = 0.1482559
+```
+
+```{r}
+######
+### HOW MUCH DID BA VARY OVER THE STUDY PERIOD?
+#####  
+alldat<- statdat %>% filter(cluster=='all')    
+max(alldat$BA)/min(alldat$BA)
+max(alldat$mean_size)/min(alldat$mean_size)
+max(alldat$num_fires)/min(alldat$num_fires)
+
+######
+### CORRELATIONS BETWEEN BURNED AREA AND FIRE SIZE, NUM FIRES
+##### 
+
+
+cor(sqrt(alldat$BA),log(alldat$num_fires)); plot(sqrt(alldat$BA)~log(alldat$num_fires))
+cor(sqrt(alldat$BA),alldat$mean_size); plot(sqrt(alldat$BA)~alldat$mean_size)
+cor(log(alldat$num_fires),alldat$mean_size); plot(log(alldat$num_fires)~alldat$mean_size)
+
+
+cor.test(sqrt(alldat$BA),log(alldat$num_fires))$p.value #1.422993e-06
+cor.test(sqrt(alldat$BA),alldat$mean_size)$p.value #6.833478e-07
+cor.test(log(alldat$num_fires),alldat$mean_size)$p.value #0.01317527
+
+
+
+```
+
+## Machine learning analysis
+
+This code fits the histogram-based gradient boosting regression tree used to determine the drivers of spatial variability in fire size. It also determines feature importances and exports importances and partial dependence information for later plotting.
+
+```{python}
+###########################
+### set up libraries
+###########################
+import pandas as pd
+import rfpimp as rfpimp
+import numpy as np
+from sklearn.model_selection import GridSearchCV,train_test_split, RepeatedKFold, cross_val_score
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.inspection import permutation_importance, partial_dependence
+from sklearn.preprocessing import OrdinalEncoder
+
+import time
+from datetime import timedelta
+
+####################################
+#### Read in data, delete unnecessary columns, identify categorical columns,
+####  and define x and y.
+####################################
+df = pd.read_csv('firesize_and_variables_cleaned.csv')
+## drop unnecessary columns
+df= df.drop(['UniqueId', 'TotDays', 'FireYr',\
+            'MaxDay', 'meltwater', \
+             'ASPTR', 'aspect','temp_annual', 'temp_snowoff',
+             'area_connect',\
+             'precip_annual', 'precip_snowoff', ],axis=1)
+oe = OrdinalEncoder()
+df[['ArcSub']] = oe.fit_transform(df[['ArcSub']])
+df[['EcoName']] = oe.fit_transform(df[['EcoName']])
+
+x_size = df.drop(['SizeHa'],axis=1)             
+          
+y_size = np.log(df['SizeHa'])
+
+print(list(x_size.columns))
+####################################
+#### Model selection: first do a wide grid search, 
+####  then narrow down and do another grid search.
+####################################
+
+##################
+# define the grid of values to search [WIDE SEARCH]
+##################
+grid = dict()
+
+grid['learning_rate'] = [0.0001,0.001, 0.01, 0.1, 1]
+grid['max_depth'] = [50, 100,150,200,250]
+grid['max_bins'] = [10, 20, 40, 60,80,100,120]  
+grid['max_leaf_nodes'] =[ None]
+
+grid_search = GridSearchCV(estimator=HistGradientBoostingRegressor(
+                            categorical_features = [0,1]),
+                           param_grid=grid, n_jobs=-1, cv=10)
+                           
+grid_result = grid_search.fit(x_size, y_size)
+
+# summarize the best score and configuration
+print("Best: %f using %s" % (grid_result.best_score_, grid_result.best_params_))
+
+##################
+# define the grid of values to search [NARROW SEARCH]
+##################
+grid = dict()
+
+grid['learning_rate'] = [ 0.05, 0.08, 0.1, 0.2, 0.3, 0.4, 0.5]
+grid['max_depth'] = [10, 20, 30, 40, 50, 60, 70, 80]
+grid['max_bins'] = [110, 120, 130, 140, 150]  
+grid['max_leaf_nodes'] =[ None]
+
+grid_search = GridSearchCV(estimator=HistGradientBoostingRegressor(
+                            categorical_features = [0,1]),
+                           param_grid=grid, n_jobs=-1, cv=10)
+                           
+grid_result = grid_search.fit(x_size, y_size)
+
+# summarize the best score and configuration
+print("Best: %f using %s" % (grid_result.best_score_, grid_result.best_params_))
+
+####################################
+###  Fit and evaluate the model
+####################################
+
+### fit the model using the hyperparamaters from grid search
+sizemodel = HistGradientBoostingRegressor(
+                categorical_features = [0,1],
+                max_leaf_nodes= None,
+                max_bins= 140, 
+                learning_rate=0.08,
+                max_depth=10)
+
+## fit the model
+sizemodel.fit(x_size, y_size)
+
+# evaluate the model
+cv = RepeatedKFold(n_splits=10, n_repeats=100, random_state=1)
+
+n_scores = cross_val_score(sizemodel, x_size, y_size, scoring='r2', cv=cv, n_jobs=-1, error_score='raise')
+print('R2: %.3f (%.3f)' % (np.mean(n_scores), np.std(n_scores)))
+
+####################################
+####### Determine feature importances. 
+####### First, get individual importances. 
+######## Then, get grouped importances.
+####################################
+
+##################
+#### get feature permutation importances (individual variables)
+##################
+pi_size = permutation_importance(sizemodel, x_size, y_size, n_repeats=100,
+                            random_state=42, n_jobs=-1)
+
+sorted_idx_size = pi_size.importances_mean.argsort()
+sorted_names_size = np.array(list(x_size.columns))[sorted_idx_size]
+
+permimport_size = pd.DataFrame({'mean' : pi_size.importances_mean[sorted_idx_size].T,\
+                          'stdev' : pi_size.importances_std[sorted_idx_size].T,\
+                           'variable': sorted_names_size})
+
+# save as df for later use
+pd.DataFrame(permimport_size).to_csv("size_permimportance_all.csv", index=False)
+
+##################
+#### get feature permutation importances (grouped variables)
+##################
+grouped_features_size = [['treecover','larch_percent','org_fraction','connected','MinDay','soiltemp'],
+                    ['SLPPCT','elevation',  \
+                     'latitude', 'ma_precip', 'ma_temp', 'ruggedness', 'sand', 
+                    'EcoName', 'ArcSub', 'water_percent'],
+                    ['vpd', 'wind', 'pdsi', 'cwd', 'temp_max', \
+                     'temp_annual_anom', 'temp_snowoff_anom',\
+                     'melt_anom', 'precip_annual_anom', \
+                     'precip_snowoff_anom']]
+
+valsize = [(rfpimp.importances(sizemodel, x_size, y_size, features =grouped_features_size).T)\
+         for _ in range(100)]
+mean_feats_size = pd.concat(valsize).mean()
+std_feats_size = pd.concat(valsize).std()
+groupedfeat_size = pd.DataFrame(mean_feats_size).merge(pd.DataFrame(std_feats_size), on='Feature').reset_index()
+groupedfeat_size.columns = ['Feature','mean', 'std']
+
+##################
+## change variable names to something intelligible
+##################
+groupedfeat_size["Feature"].replace(\
+            ['treecover\nlarch_percent\norg_fraction\nmesh_all\nMinDay\nsoiltemp', \
+            'SLPPCT\nelevation\nlatitude\nma_precip\nma_temp\nruggedness\nsand\nEcoName\nArcSub\nwater_percent',\
+            'vpd\nwind\npdsi\ncwd\ntemp_max\ntemp_annual_anom\ntemp_snowoff_anom\nmelt_anom\nprecip_annual_anom\nprecip_snowoff_anom'],\
+            ['Fuel availability','Landscape characteristics', 'Weather'],\
+            inplace= True, regex=True)
+##################
+### save for later use
+##################
+pd.DataFrame(groupedfeat_size).to_csv("size_groupedimportance_all.csv", index=False)
+
+######################################################
+### Generate partial dependence values and export
+######################################################
+
+pardep_water = partial_dependence(sizemodel, x_size, 'water_percent',kind='average' , percentiles=(0, 1), grid_resolution=216)
+pardep_slope = partial_dependence(sizemodel,x_size.dropna(subset=['SLPPCT']), 'SLPPCT',kind='average', percentiles=(0, 1), grid_resolution=216 )
+pardep_larch = partial_dependence(sizemodel, x_size, 'larch_percent',kind='average' , percentiles=(0, 1), grid_resolution=216)
+pardep_minday = partial_dependence(sizemodel, x_size, 'MinDay',kind='average' , percentiles=(0, 1), grid_resolution=216)
+pardep_cwd = partial_dependence(sizemodel, x_size, 'cwd',kind='average' , percentiles=(0, 1), grid_resolution=216)
+pardep_vpd = partial_dependence(sizemodel, x_size, 'vpd',kind='average', percentiles=(0, 1), grid_resolution=216 )
+
+
+
+depdf = pd.DataFrame({'water_x':pardep_water['values'][0],
+                     'water_y': pardep_water['average'][0],
+                      'slope_x':pardep_slope['values'][0],
+                     'slope_y': pardep_slope['average'][0],
+                     'dob_x':pardep_minday['values'][0],
+                     'dob_y': pardep_minday['average'][0],
+                    'cwd_x':pardep_cwd['values'][0],
+                     'cwd_y': pardep_cwd['average'][0],
+                        'vpd_x':pardep_vpd['values'][0],
+                     'vpd_y': pardep_vpd['average'][0],
+                     'larch_x':pardep_larch['values'][0],
+                     'larch_y': pardep_larch['average'][0]})
+
+depdf.to_csv("pd_df.csv", index=False)
+```
+
+# Figures and tables
+
+## Figure 1
+
+Trends in mean fire size, number of fires, and total burned area
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(cowplot)
+library(scales)
+
+######
+### READ IN AND CLEAN DATA
+#####
+
+firedat<- read.csv("data_with_kmeans.csv")
+
+### derive the number of fires and total burn area
+
+data <- firedat %>%   mutate(cluster = as.character(cluster)) %>%
+          bind_rows(firedat %>% mutate(cluster = as.character("all"))) %>%
+          group_by(FireYr, cluster) %>% summarise(`mean size (ha)` = mean(SizeHa),
+                                                         std_size = sd(SizeHa),
+                                                  `number of fires` = n(),
+                                                  `burned area (ha)` = sum(SizeHa))%>%
+          mutate(ste_size = `mean size (ha)`/sqrt(`number of fires`)) %>% drop_na(cluster) %>%
+          select(-std_size) %>% 
+  gather(key = key, value = value, -c(FireYr, cluster)) %>%
+  mutate(side = ifelse(cluster=='all', 'all', 'right')) 
+
+data$cluster<-dplyr::recode(data$cluster, 
+                     '2' = 'lowland' ,
+                    '1' = 'upland')
+data$key<-factor(data$key, levels = c('mean size (ha)',
+                                            "number of fires",
+                                            "burned area (ha)"))
+######
+### PLOT TRENDS OVER TIME
+#####
+
+
+base_size = 28
+top<-ggplot(data %>% filter(key =='mean size (ha)'), aes(x=FireYr, y = value, color=cluster)) + 
+            theme_light(base_size = base_size)+ ylab('mean \nsize (ha)') + xlab('')+
+            geom_point( size=3) + geom_line(size=1)+
+            scale_color_manual(values=c('#756555', '#BC944C', '#a4ab82')) +
+            scale_y_continuous(#trans="log",
+                               labels = scales::label_number_si()) +
+            theme(panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+                  legend.title = element_blank(),
+                  legend.box.spacing = unit(0, "pt"),
+                  legend.position='top',
+                  legend.direction='horizontal')
+middle<-ggplot(data %>% filter(key == "number of fires"), aes(x=FireYr, y = value, color=cluster)) + 
+          theme_light(base_size = base_size)+ ylab('number\nof fires') + xlab('')+
+          geom_point( size=3) + geom_line(size=1)+
+          scale_color_manual(values=c('#756555', '#BC944C', '#a4ab82')) +
+          scale_y_continuous( labels = scales::label_number_si()) +
+          theme(panel.grid.major = element_blank(),
+                panel.grid.minor = element_blank(),
+                legend.title = element_blank(),
+                legend.position='none')
+
+bottom<-ggplot(data %>% filter(key == "burned area (ha)"), aes(x=FireYr, y = value, color=cluster)) + 
+            theme_light(base_size = base_size)+
+           ylab('burned \narea (ha)') + xlab('fire year')+
+            geom_point( size=3) + geom_line(size=1)+
+            scale_color_manual(values=c('#756555', '#BC944C', '#a4ab82')) +
+            scale_y_continuous( labels = scales::label_number_si()) +
+            theme(panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+                  legend.title = element_blank(),
+                  legend.position='none')
+
+
+allplots<-plot_grid(top, middle, bottom, align='v',
+                    ncol=1, rel_widths = c(1.2, 1.2, 0.05))
+######
+### save
+#####
+ggsave("Fig1.jpeg", allplots,
+       path="figures/",
+       width=100, height=150,units="mm", dpi=500, scale=2.25)
+```
+
+## Figure 2
+
+Relationship between total burned area and number of fires and mean fire size in upland and lowland landscape positions.
+
+```{r}
+library(tidyverse)
+library(cowplot)
+
+######
+### READ IN AND CLEAN DATA
+#####
+
+firedat<- read.csv("data_with_kmeans.csv")
+
+
+### derive the number of fires and total burn area
+
+df <- firedat %>% drop_na(cluster) %>% 
+                mutate(cluster = as.character(cluster)) %>%
+                group_by(FireYr, cluster) %>% summarise(mean_size = mean(SizeHa),
+                                          num_fires = n(),
+                                          BA = sum(SizeHa)) #%>%
+                #gather("variable", "value", mean_size:num_fires) 
+
+
+
+left<-ggplot(df, aes(x=num_fires, y=BA, color=cluster)) +
+            geom_point(size=4) + 
+            scale_color_manual(values=c('#BC944C', '#a4ab82'))+
+            ylab('burned area (ha)') + xlab('number\nof fires') +
+            scale_y_continuous(labels = scales::label_number_si()) +
+            theme_light(base_size = 28)+
+            theme(panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+                  legend.title = element_blank(),
+                  legend.box.spacing = unit(0, "pt"),
+                  legend.position='none')
+          
+middle<-ggplot(df, aes(x=mean_size, y=BA, color=cluster)) +
+                geom_point(size=4) + 
+                scale_color_manual(values=c('#BC944C', '#a4ab82'),
+                                   labels=c('upland', 'lowland'))+
+                ylab('burned area (ha)') + xlab('mean fire\nsize (ha)') +
+                scale_y_continuous(labels = scales::label_number_si()) +
+                scale_x_continuous(labels = scales::label_number_si()) +
+                theme_light(base_size = 28)+
+                theme(panel.grid.major = element_blank(),
+                      panel.grid.minor = element_blank(),
+                      legend.title = element_blank(),
+                      legend.box.spacing = unit(0, "pt"),
+                      legend.position='none')
+
+right<-ggplot(df, aes(x=num_fires, y=mean_size, color=cluster))+
+            geom_point(size=4) + 
+            scale_color_manual(values=c('#BC944C', '#a4ab82'),
+                               labels=c('upland', 'lowland'))+
+            xlab('number\nof fires') + ylab('mean fire size (ha)') +
+            scale_y_continuous(labels = scales::label_number_si()) +
+            theme_light(base_size = 28)+
+            theme(panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+                  legend.title = element_blank(),
+                  legend.box.spacing = unit(0, "cm"))
+
+allplots<-plot_grid(left, middle, right,
+          nrow=1, 
+          rel_widths = c(1,1,1.4))
+
+
+ggsave("Fig2.jpeg", allplots,
+       path="figures/",
+       width=150, height=100,units="mm", dpi=500, scale=2)
+```
+## Figure 3
+
+Cumulative area burned in each fire year.
+
+```{r}
+library(tidyverse)
+library(scales)
+
+
+#############
+##### read in data
+#############
+
+firedat<- read.csv("data_with_kmeans.csv")
+
+#############
+##### prepare data for plotting
+#############
+
+firedat$FireYr<-as.factor(firedat$FireYr)
+firedat$UniqueId<-as.factor(firedat$UniqueId)
+
+df1<-firedat %>% 
+  mutate(percentile_rank = ntile(SizeHa, 20)) %>% arrange(percentile_rank)
+
+firedat$fire_group <- ifelse(firedat$SizeHa <10000, 'small (0-10K ha)',
+                             ifelse(firedat$SizeHa<100000, 'medium (10-100K ha)',
+                                    ifelse(firedat$SizeHa<1000000, 'large (100K-1M ha)', 'mega (>1M ha)')))
+
+firedat$fire_group<-factor(firedat$fire_group, levels=rev(c('small (0-10K ha)','medium (10-100K ha)', 'large (100K-1M ha)', 'mega (>1M ha)')))
+firedat <- firedat %>% arrange(fire_group)
+
+fire_count <- firedat %>% group_by(FireYr, fire_group) %>% summarise(num_fires = n(), totalburn = sum(SizeHa)) %>% arrange(fire_group)
+
+#############
+##### plot and save
+#############
+
+
+plot<- ggplot(firedat, aes(x=FireYr, y=SizeHa, fill=fire_group)) +
+        geom_col() + 
+  scale_fill_manual(name='Fire size',
+                    values = rev(c("#E5E5E5", "#BFCDD6", "#78A4B0", "#4A7C88")))+
+        scale_y_continuous(  labels = scales::label_number(scale_cut=cut_si('')),
+                             name="Cumulative area burned (ha)") +
+        theme_light(base_size = 23) + xlab('Fire year') +
+        theme(axis.text.x = element_text(angle = 45,  hjust=1),
+              axis.title.x = element_text(vjust=-0.7),
+              legend.position=c(.2,.85),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank()) +
+        geom_text(data=fire_count, aes(label = num_fires, x=FireYr, y=totalburn),fontface='bold',
+                  size = 5,  position = position_stack(vjust = .5))
+
+
+ggsave("figure3.jpeg", plot,
+       path="figures/",
+       width=120, height=100,units="mm", dpi=500, scale=2.5)
+
+
+#############
+##### SUMMARY STATISTICS
+#############
+
+fire_stats<- firedat %>% group_by(fire_group) %>% 
+              summarise(num_fires = n(), totalburn = sum(SizeHa)) %>%
+              mutate(percent_fires = 100*num_fires/(sum(num_fires)),
+                     percent_burned = 100*totalburn/sum(totalburn))
+```
+## Figure 4
+
+The relative importance of predictor variables in explaining fire size. (Making a pretty figure based on output from machine learning analysis)
+
+```{r}
+
+library(tidyverse)
+library(cowplot)
+
+### read in data
+dat_all<- read.csv("size_permimportance_all.csv")
+dat_grouped<- read.csv("size_groupedimportance_all.csv")
+
+basesize=23
+
+#########
+#### CLEAN DATA
+#########
+## add groups
+dat_all<- dat_all %>% mutate( group =
+                if_else(variable %in% c('ArcSub', 'EcoName', 'ma_precip', 
+                                 'ruggedness', 'elevation', 'latitude',
+                                 "SLPPCT", 'ma_temp', 'water_percent', 'sand'),
+                        'site characteristics',
+                if_else(variable %in% c('treecover', 'MinDay', 'org_fraction', 'mesh_all',
+                                 'larch_percent', 'soiltemp'), 'fuel characteristics',
+                'weather conditions')))
+
+## put in the right order
+dat_all$group <- factor(dat_all$group, 
+                        levels = c("site characteristics", 
+                                   "fuel characteristics", "weather conditions"))
+## clean up variable names
+
+dat_all$variable<-recode(dat_all$variable, 
+                                 "water_percent" = 'proportion water pixels in fire perimeter',
+                                  "larch_percent" = "proportion larch pixels in fire perimeter",
+                                  "SLPPCT" = 'slope',
+                                  'MinDay' = 'first burn day', 
+                                  'cwd' = 'climatic water deficit',
+                                  'vpd' = 'vapor pressure deficit', 
+                                  'mesh_all' = 'tree cover connectivity', 
+                                   'treecover' = '% tree canopy cover', 
+                                  'temp_annual_anom' = 'annual temp anomaly',
+                                  'org_fraction' = 'soil carbon density',
+                                  'pdsi' ='Palmer Drought Severity Index ',
+                                  'melt_anom' = 'meltwater anomaly', 
+                                  'ma_temp' = 'mean annual temp', 
+                                  'precip_snowoff_anom' = 'precip anomaly in the preceding summer',
+                                  'sand' = '% sand in soil',
+                                  'ma_precip' = 'mean annual precip', 
+                                  'temp_snowoff_anom' = 'temp anomaly in the preceding summer',
+                                  'temp_max' = 'maximum air temp in fire month', 
+                                   'wind' = 'wind speed', 
+                                  'soiltemp' = 'soil moisture',
+                                  'precip_annual_anom' = 'annual precip anomaly',
+                                  'EcoName' =  'Ecozone', 
+                                  'ArcSub' ='Arctic/subarctic' )
+
+dat_grouped$Feature <- factor(dat_grouped$Feature, 
+                              levels = c("Landscape characteristics", 
+                                         "Fuel availability", "Weather"))
+dat_grouped$Feature<-recode(dat_grouped$Feature,
+                            "Landscape characteristics" = 'site characteristics',
+                            'Fuel availability' = 'fuel characteristics', 
+                            'Weather' = 'weather conditions')
+#########
+#### PLOT
+#########
+indviplot<-ggplot(dat_all, aes(x=mean, y=reorder(variable, mean))) +
+              geom_bar(stat="identity", aes(fill=group), alpha=0.7) +
+              geom_errorbar( aes(xmin=mean-stdev,xmax=mean+stdev), 
+                             width=0.4, alpha=0.9, size=1.3) + xlim(0,0.9) +
+              scale_fill_manual(values = c('#428198', '#b0a171', '#be673a'))+
+              theme_light(base_size=basesize) + xlab(' ') + ylab ('') +
+              theme(panel.grid.major = element_blank(),
+                    panel.grid.minor = element_blank(),
+                    axis.text.x = element_blank(),
+                    axis.ticks.x = element_blank(),
+                    legend.position='none')
+
+groupplot<-ggplot(dat_grouped, aes(x=mean, y=reorder(Feature, mean))) +
+              geom_bar(stat="identity", aes(fill=Feature), alpha=0.7, width=0.45) +
+              geom_errorbar( aes(xmin=mean-std,xmax=mean+std), 
+                             width=0.4, alpha=0.9, size=1.3) +xlim(0,0.9) +
+              scale_fill_manual(values = c('#428198', '#b0a171', '#be673a'))+
+              theme_light(base_size=basesize) + xlab('relative importance') + ylab ('') +
+              theme(panel.grid.major = element_blank(),
+                    panel.grid.minor = element_blank(),
+                    legend.position='none')
+  
+together<-plot_grid(indviplot,NULL,groupplot,
+                    ncol=1,align='v', rel_heights = c(1,-0.03,0.2) )
+
+#########
+#### SAVE
+#########
+
+ggsave("Fig4.jpeg", together,
+       path="figures/",
+       width=120, height=150,units="mm", dpi=500, scale=2.5)
+
+```
+
+## Figure 5
+
+Histograms and partial dependence plots for explaining spatial variation in fire size.
+
+```{r}
+library(tidyverse)
+library(cowplot)
+
+#############
+##### read in data
+#############
+
+partial<- read.csv("pd_df.csv")
+firedat<- read.csv("data_with_kmeans.csv")
+
+#############
+##### define function to graph histogram and ppd on the same plot
+#############
+
+plotfun<- function(histvar, xvar, yvar, colorvar, xlabel) {
+  ### setting up paramaters
+  xhist<-hist(histvar)$breaks
+  yhist<-hist(histvar)$counts
+  ylim.left <- range(yhist)  
+  ylim.right <- range(yvar)  
+  b <- diff(ylim.left)/diff(ylim.right)
+  a <- ylim.left[1] - b*ylim.right[1]
+  
+  plot<-  ggplot() + 
+    geom_histogram(aes(x=histvar), color='grey', fill='grey', alpha=0.6) +
+    geom_line(aes(x=xvar, y=yvar*b +a),size=1.5, color=colorvar) +
+    xlab(xlabel) + 
+    scale_y_continuous("frequency", 
+                       sec.axis =   sec_axis(~ (. - a)/b, name='marginal impact\non fire size')) +
+    theme_light(base_size=24) + 
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line.y.right = element_line(color = colorvar), 
+          axis.ticks.y.right = element_line(color = colorvar),
+          axis.text.y.right = element_text(color = colorvar), 
+          axis.title.y.right = element_text(color = colorvar),
+          legend.position = 'none')
+  
+  plot 
+}
+
+#############
+##### run plotting function for the two most important site characteristics, 
+##### fuel characteristics, and weather conditions
+#############
+
+###site variables
+###landscape variables
+waterplot<-plotfun(firedat$water_percent, partial$water_x[partial$water_x>0], partial$water_y[partial$water_x>0], '#428198', 'proportion of water pixels\nin fire perimeter')
+slopeplot<-plotfun(firedat$SLPPCT, partial$slope_x, partial$slope_y, '#428198', 'mean slope of pixels\nin fire perimeter')
+
+### fuel variables
+larchplot<-plotfun(firedat$larch_percent, partial$larch_x[partial$larch_x<1], partial$larch_y[partial$larch_x<1], '#b0a171', 'proportion of larch pixels\nin fire perimeter')
+minplot<-plotfun(firedat$MinDay, partial$dob_x, partial$dob_y, '#b0a171', 'first burn day')
+
+### weather variables
+cwdplot<-plotfun(firedat$cwd, partial$cwd_x, partial$cwd_y, '#be673a', 'climatic water deficit\nin month of burn')
+vpdplot<-plotfun(firedat$vpd, partial$vpd_x, partial$vpd_y, '#be673a', 'vapor pressure deficit\nin month of burn')
+
+
+#############
+##### Put plots together and save
+#############
+
+finalplot<-plot_grid(waterplot,
+          slopeplot,
+          larchplot, 
+          minplot, 
+          cwdplot, 
+          vpdplot,
+          nrow=3, ncol=2)
+
+ggsave("fig5.jpeg", finalplot,
+       path="figures/",
+       width=120, height=150,units="mm", dpi=500, scale=2.5)
+
+##https://stackoverflow.com/questions/3099219/ggplot-with-2-y-axes-on-each-side-and-different-scales
+
+```
+
+## Figure 6
+
+FIGURE 5: Summary statistics for fire size, number of fires, and burned area binned by high/low temperature/precipitation years and landscape position.
+
+```{r}
+library(ggpubr)
+library(tidyverse)
+library(cowplot)
+library(see)
+library(gtable)
+library(grid)
+
+#############
+##### read in data
+#############
+
+firedat<- read.csv("data_with_kmeans.csv")
+
+##########################
+#############
+##### PREPARE DATA
+#############
+##########################
+firemean <- firedat %>% dplyr::select(-c(UniqueId, EcoName, ArcSub)) %>% 
+                group_by(FireYr) %>%
+                summarise(BA = sum(SizeHa),
+                          n_fires = n(),
+                          precip_annual_mean = mean(precip_annual, na.rm=T),
+                          temp_annual_mean = mean(temp_annual, na.rm=T)) %>% 
+                mutate(precip = as.numeric(ntile(precip_annual_mean, 2)),
+                       temp =  as.numeric(ntile(temp_annual_mean, 2))) %>% ungroup() 
+
+##########################
+##########################
+##### SIZE DATA
+##########################
+##########################
+
+### prepare dfs
+    df_2clust<- left_join(firedat, firemean, by='FireYr') %>% 
+                select(SizeHa, FireYr, cluster, precip,temp) %>%
+                mutate(temp= as.numeric(ifelse(temp ==1, 3,4))) %>%
+                mutate(cluster = as.character(cluster)) %>%
+                dplyr::arrange(temp)  %>% 
+                gather("climate_var", "rank", precip:temp) 
+    
+    df_allclust<- left_join(firedat, firemean, by='FireYr') %>% 
+                    select(SizeHa, FireYr, cluster, precip,temp) %>%
+                    mutate(temp= as.numeric(ifelse(temp ==1, 3,4))) %>%
+                    mutate(cluster = as.character('all')) %>%
+                    dplyr::arrange(temp)  %>% 
+                    gather("climate_var", "rank", precip:temp)
+    
+    df_firesize <- bind_rows(df_2clust, df_allclust) 
+
+#### % change labels
+per_lab_precip<- df_firesize %>% filter(climate_var=="precip") %>% 
+            drop_na(cluster) %>%
+            group_by(cluster, rank) %>% 
+            summarize(meansize = mean(SizeHa)) %>%
+            mutate(abs_change = meansize-lead(meansize),
+                   pct_change = round((meansize/lead(meansize) - 1),2))%>%
+            mutate(SizeHa = 13000) %>% 
+            select(pct_change, rank, cluster,SizeHa) %>% 
+            drop_na(pct_change) %>%
+            mutate(rank = as.factor(rank),
+                   climate_var = "precipitation in the\npreceding year",
+                   dummyvar = 'fire size\n(ha)')
+
+per_lab_temp<- df_firesize %>% filter(climate_var=="temp") %>% 
+                  drop_na(cluster) %>%
+                  group_by(cluster, rank) %>% 
+                  summarize(meansize = mean(SizeHa)) %>% 
+                  arrange(cluster,-rank) %>%
+                  mutate(abs_change = meansize-lead(meansize),
+                         pct_change = round((meansize/lead(meansize) - 1),2))%>%
+                  mutate(SizeHa = 13000) %>% 
+                  select(pct_change, rank, cluster,SizeHa) %>% 
+                  drop_na(pct_change)%>%
+                  mutate(rank = as.factor(rank),
+                         climate_var = "temperature in the\npreceding year",
+                         dummyvar = 'fire size\n(ha)')
+
+size_labels<-rbind(per_lab_precip, per_lab_temp)
+
+##########################
+##########################
+##### N_FIRES DATA
+##########################
+##########################
+### prepare dfs
+n_2clust<- left_join(firedat, firemean, by='FireYr') %>% 
+            select(FireYr, cluster, precip,temp, UniqueId) %>%
+            mutate(temp= as.numeric(ifelse(temp ==1, 3,4))) %>%
+            dplyr::arrange(temp)  %>%
+            gather("climate_var", "rank", precip:temp) %>% distinct()%>%
+            group_by(rank, cluster, climate_var, FireYr) %>%
+            summarize(n_fires = n()) %>%
+            drop_na(cluster) %>% mutate(cluster = as.character(cluster)) 
+
+n_allclust<- left_join(firedat, firemean, by='FireYr') %>% 
+                select(FireYr, cluster, precip,temp, UniqueId) %>%
+                mutate(temp= as.numeric(ifelse(temp ==1, 3,4))) %>%
+                dplyr::arrange(temp)  %>%
+                gather("climate_var", "rank", precip:temp) %>% distinct()%>%
+                group_by(rank, climate_var, FireYr) %>%
+                summarize(n_fires = n()) %>%
+                 mutate(cluster = as.character('all')) 
+
+df_nfires <- bind_rows(n_2clust, n_allclust)
+
+
+
+#### % change labels
+n_lab_precip<- df_nfires %>% filter(climate_var=="precip") %>% 
+        group_by(cluster, rank) %>% 
+        summarize(n_tot = mean(n_fires)) %>%
+        mutate(abs_change = n_tot-lead(n_tot),
+         pct_change = round((n_tot/lead(n_tot) - 1),2),
+         n_fires = 600)%>%
+      select(pct_change, rank, cluster,n_fires) %>% 
+        drop_na(pct_change) %>%
+        mutate(rank = as.factor(rank),
+         climate_var = 'precip',
+         dummyvar = 'number\nof fires')
+
+n_lab_temp<- df_nfires %>% filter(climate_var=="temp") %>% 
+          group_by(cluster, rank) %>% 
+          summarize(n_tot = mean(n_fires)) %>%
+          arrange(cluster,-rank) %>%
+          mutate(abs_change = n_tot-lead(n_tot),
+                 pct_change = round((n_tot/lead(n_tot) - 1),2),
+                 n_fires = 600)%>%
+          select(pct_change, rank, cluster,n_fires) %>% 
+          drop_na(pct_change) %>%
+          mutate(rank = as.factor(rank),
+              climate_var = 'temp',
+              dummyvar = 'number\nof fires')
+
+n_labels<-rbind(n_lab_precip, n_lab_temp)
+
+##########################
+##########################
+##### BURNED AREA DATA
+##########################
+##########################
+### prepare dfs
+BA_2clust<- left_join(firedat, firemean, by='FireYr') %>% 
+            select(FireYr, cluster, precip,temp, SizeHa) %>%
+            mutate(temp= as.numeric(ifelse(temp ==1, 3,4))) %>%
+            dplyr::arrange(temp)  %>%
+            gather("climate_var", "rank", precip:temp) %>% 
+            group_by(rank, cluster, climate_var, FireYr) %>%
+            summarize(BA = sum(SizeHa)) %>%
+            drop_na(cluster) %>% mutate(cluster = as.character(cluster)) 
+
+BA_allclust<- left_join(firedat, firemean, by='FireYr') %>% 
+              select(FireYr, precip,temp, SizeHa) %>%
+              mutate(temp= as.numeric(ifelse(temp ==1, 3,4))) %>%
+              dplyr::arrange(temp)  %>%
+              gather("climate_var", "rank", precip:temp) %>% 
+              group_by(rank, climate_var, FireYr) %>%
+              summarize(BA = sum(SizeHa)) %>%
+              mutate(cluster = as.character('all')) 
+
+df_BAfires <- bind_rows(BA_2clust, BA_allclust)
+
+
+
+#### % change labels
+BA_lab_precip<- df_BAfires %>% filter(climate_var=="precip") %>% 
+              group_by(cluster, rank) %>% 
+              summarize(iqr = IQR(BA),
+                        BA = mean(BA)) %>%
+              mutate(abs_change = BA-lead(BA),
+                     pct_change = round((BA/lead(BA) - 1),2))%>%
+              select(pct_change, rank, cluster, BA, iqr) %>% 
+              drop_na(pct_change) %>%
+              mutate(rank = as.factor(rank),
+                     climate_var = 'precip',
+                     dummyvar = 'burned\narea (ha)',
+                     BA = 10000000)
+
+BA_lab_temp<- df_BAfires %>% filter(climate_var=="temp") %>% 
+              group_by(cluster, rank) %>% 
+              summarize(iqr = IQR(BA),
+                        BA = mean (BA)) %>%
+              arrange(cluster,-rank) %>%
+              mutate(abs_change = BA-lead(BA),
+                     pct_change = round((BA/lead(BA) - 1),2))%>%
+              select(pct_change, rank, cluster, BA, iqr) %>% 
+              drop_na(pct_change) %>%
+              mutate(rank = as.factor(rank),
+                     climate_var = 'temp',
+                     dummyvar = 'burned\narea (ha)',
+                     BA = 10000000) 
+
+
+BA_labels<-rbind(BA_lab_precip, BA_lab_temp) 
+
+##########################
+##########################
+##### PREPARE DATA FOR PLOTTING
+##########################
+##########################
+
+##fire size
+df_FS <-df_firesize %>%   mutate(rank = as.factor(rank),
+                          cluster = as.factor(cluster)) %>% drop_na(cluster) %>%
+                          mutate(dummyvar = 'fire size\n(ha)')
+
+df_FS$cluster<-recode(df_FS$cluster, "1" = 'upland','2' = 'lowland')
+df_FS$climate_var<-recode(df_FS$climate_var, 'precip' = "precipitation in the\npreceding year", 'temp' = "temperature in the\npreceding year")
+
+size_labels$cluster<-recode(size_labels$cluster, "1" = 'upland','2' = 'lowland')
+
+## num fires
+df_n <-df_nfires %>%  mutate(rank = as.factor(rank),
+                            cluster = as.factor(cluster)) %>% drop_na(cluster) %>%
+                    mutate(dummyvar = 'number\nof fires')
+                    
+df_n$cluster<-recode(df_n$cluster, "1" = 'upland','2' = 'lowland')
+
+n_labels$cluster<-recode(n_labels$cluster, "1" = 'upland','2' = 'lowland')
+
+## burned area
+
+df_BA <-df_BAfires%>%  mutate(rank = as.factor(rank),
+                             cluster = as.factor(cluster)) %>% drop_na(cluster) %>%
+                    mutate(dummyvar = 'burned\narea (ha)')
+
+df_BA$cluster<-recode(df_BA$cluster, "1" = 'upland','2' = 'lowland')
+
+BA_labels$cluster<-recode(BA_labels$cluster, "1" = 'upland','2' = 'lowland')
+
+
+##########################
+##########################
+##### PLOTS
+##########################
+##########################
+update_geom_defaults("text", list(size = 6))
+
+size_plot<-ggplot(df_FS,
+                   aes(y=SizeHa,x=cluster, color=rank, fill=rank))  +
+              facet_grid(dummyvar~climate_var, switch = 'y')+
+              geom_boxplot(outlier.shape  = NA, width=0.5, linewidth=1,
+                           position = position_dodge(0.6),
+                           show.legend = FALSE) +
+              stat_summary(fun=mean, geom="point", shape=17, size=3,
+                           position = position_dodge(0.6),alpha=1,
+                           show.legend = FALSE) +
+              scale_y_continuous(labels = scales::label_number_si(),
+                                 position = "right") +
+              coord_cartesian(ylim= quantile(df_firesize$SizeHa, c(0, 0.92)),
+                              xlim = c(1,3))+
+              geom_text(data=size_labels, 
+                        color='black', label=scales::percent(size_labels$pct_change))+
+              xlab('') + ylab('') +
+              scale_fill_manual(values=alpha(c( '#f2ad73','#472151', "#355070", "#e56b6f"),0.3))+
+              scale_color_manual(values=c('#f2ad73','#472151', "#355070", "#e56b6f"))+
+              theme_light(base_size=24) + 
+              theme(panel.grid.major = element_blank(),
+                    panel.grid.minor = element_blank(),
+                    strip.background = element_rect(fill="#666f88"),
+                    strip.text = element_text(colour = 'white'),
+                   # strip.text.y.left = element_text(angle = 0,  margin = margin(0,0.6,0,0.6, "cm")),
+                    axis.text.x=element_blank(),
+                    axis.ticks.x=element_blank(),
+                   plot.margin = unit(c(1,0,0,1), "cm"),
+                   legend.position = 'none')
+
+
+
+n_plot<-ggplot(df_n, aes(y=n_fires,x=cluster, color=rank, fill=rank))  +
+        facet_grid(dummyvar~climate_var, switch = 'y')+
+        geom_boxplot(outlier.shape  = NA, width=0.5, linewidth=1,
+                     position = position_dodge(0.6),
+                     show.legend = FALSE) +
+        stat_summary(fun=mean, geom="point", shape=17, size=3,
+                     position = position_dodge(0.6),alpha=1,
+                     show.legend = FALSE) +
+        scale_y_continuous(labels = scales::label_number_si(),
+                           position = "right") +
+        coord_cartesian(ylim= quantile(df_n$n_fires, c(0, 0.98)))+
+        geom_text(data=n_labels, 
+                  color='black', label=scales::percent(n_labels$pct_change))+
+        xlab('') + ylab('') +
+        scale_fill_manual(values=alpha(c( '#f2ad73','#472151', "#355070", "#e56b6f"),0.3))+
+        scale_color_manual(values=c('#f2ad73','#472151', "#355070", "#e56b6f"))+
+        theme_light(base_size=24) + 
+        theme(panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              strip.background.x =element_blank(),
+              strip.text.x = element_blank(),
+              strip.background.y = element_rect(fill="#666f88"),
+              strip.text.y = element_text(colour = 'white'),
+              #strip.text.y.left = element_text(angle = 0,  margin = margin(0,0.6,0,0.6, "cm")),
+              axis.text.x=element_blank(),
+              axis.ticks.x=element_blank(),
+              plot.margin = unit(c(0,0,0,1), "cm"),
+              legend.position = 'none')
+
+
+ba_plot<-ggplot(df_BA, aes(y=BA,x=cluster, color=rank, fill=rank))  +
+            facet_grid(dummyvar~climate_var, switch = 'y')+
+            geom_boxplot(outlier.shape  = NA, width=0.5, linewidth=1,
+                         position = position_dodge(0.6),
+                         show.legend = FALSE) +
+            stat_summary(fun=mean, geom="point", shape=17, size=3,
+                         position = position_dodge(0.6),alpha=1,
+                         show.legend = FALSE) +
+            scale_y_continuous(labels = scales::label_number_si(),
+                               position = "right") +
+            coord_cartesian(ylim= quantile(df_BA$BA, c(0, 0.99)))+
+            geom_text(data=BA_labels, 
+                      color='black', label=scales::percent(BA_labels$pct_change))+
+            xlab('') + ylab('') +
+           scale_fill_manual(values=alpha(c( '#f2ad73','#472151', "#355070", "#e56b6f"),0.3))+
+           scale_color_manual(values=c('#f2ad73','#472151', "#355070", "#e56b6f"))+
+            theme_light(base_size=24) + 
+            theme(panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+                  strip.background.x =element_blank(),
+                  strip.text.x = element_blank(),
+                  strip.background.y = element_rect(fill="#666f88"),
+                  strip.text.y = element_text(colour = 'white'),
+                  #strip.text.y.left = element_text(angle = 0,  margin = margin(0,0.6,0,0.6, "cm")),
+                  plot.margin = unit(c(0,0,0,1), "cm"),
+                  legend.position = 'none')
+
+
+precip_legend_plot<-ggplot(df_BA %>% filter(climate_var=='precip'),
+                           aes(y=BA,x=cluster,fill=rank))  +
+                    geom_bar(size=5, stat='identity')+
+                    scale_fill_manual(values=c( '#f2ad73','#472151'),
+                                      name=' ',
+                                      labels = c('low precip',
+                                                 'high precip'),
+                                      guide=guide_legend(title.position = 'top',
+                                                         nrow=1))+
+                    theme_light(base_size=24) + 
+                    theme(panel.grid.major = element_blank(),
+                          panel.grid.minor = element_blank(),
+                          strip.background.x =element_blank(),
+                          strip.text.x = element_blank(),
+                          strip.background.y = element_rect(fill="#666f88"),
+                          strip.text.y = element_text(colour = 'white'),
+                          #strip.text.y.left = element_text(angle = 0,  margin = margin(0,0.6,0,0.6, "cm")),
+                          plot.margin = unit(c(0,0,-0.5,1), "cm"),
+                          legend.position = 'bottom',
+                          legend.direction = 'vertical')
+
+temp_legend_plot<-ggplot(df_BA %>% filter(climate_var=='temp'),
+                           aes(y=BA,x=cluster,fill=rank))  +
+                            geom_bar(stat='identity',size=5)+
+                            scale_fill_manual(values=c( "#355070", "#e56b6f"),
+                                            name=' ',
+                                            labels = c('low temp',
+                                                'high temp'),
+                                            guide=guide_legend(title.position = 'top',
+                                                               nrow=1))+
+                            theme_light(base_size=24) + 
+                            theme(panel.grid.major = element_blank(),
+                                  panel.grid.minor = element_blank(),
+                                  strip.background.x =element_blank(),
+                                  strip.text.x = element_blank(),
+                                  strip.background.y = element_rect(fill="#666f88"),
+                                  strip.text.y = element_text(colour = 'white'),
+                                  #strip.text.y.left = element_text(angle = 0,  margin = margin(0,0.6,0,0.6, "cm")),
+                                  plot.margin = unit(c(0,0,-0.5,1), "cm"),
+                                  legend.position = 'bottom',
+                                  legend.direction = 'vertical')
+
+ledgends<-plot_grid(get_legend(precip_legend_plot), NULL, get_legend(temp_legend_plot), rel_widths=c(1,-0.3,1), nrow=1)
+
+justplots<-plot_grid(size_plot,NULL, n_plot, NULL, ba_plot, ncol=1, align='v', rel_heights = c(1.2,-0.1, 0.9, -0.1,1))
+
+everything<-plot_grid(justplots,NULL,ledgends, ncol=1, align='h',
+                      rel_heights = c(0.9,-0.04,0.1))
+
+#############
+##### save
+#############
+
+ggsave("Fig6.jpeg", everything,
+       path="figures/",
+       width=150, height=120,units="mm", dpi=500, scale=2)
+
+```
+
+## Figure 7
+
+Relationship between fire size and total burned area separated by landscape position and high/low temperature/precipitation years.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(cowplot)
+
+#############
+##### read in data
+#############
+
+firedat<- read.csv("data_with_kmeans.csv")
+
+
+#############
+##### clean up fire data
+#############
+
+
+## add means
+firemean <- firedat %>% dplyr::select(-c(UniqueId, EcoName, ArcSub)) %>% 
+  group_by(FireYr) %>%
+  summarise(across(everything(), 
+                   .f = list(mean = mean), na.rm = TRUE))
+
+
+
+## break up size classes
+firedat$fire_group <- ifelse(firedat$SizeHa <10000, 'small',
+                             ifelse(firedat$SizeHa<100000, 'medium',
+                                    ifelse(firedat$SizeHa<1000000, 'large', 'mega')))
+
+
+##########
+#### CALCULATE LOW/MED/HIGH YEARS
+#########
+
+nranks<-2
+
+firedf <- firemean %>% 
+  mutate(vpd_rank_fire =  as.factor(ntile(vpd_mean, nranks)),
+         pdsi_rank_fire =  as.factor(ntile(pdsi_mean, nranks)),
+         precip_rank_annual = as.factor(ntile(precip_annual_mean, nranks)),
+         precip_rank_snowoff = as.factor(ntile(precip_snowoff_mean, nranks)),
+         temp_rank_fire =  as.factor(ntile(temp_annual_mean, nranks))) %>% ungroup() 
+
+##########
+#### MERGE AND CLEAN UP DATA
+#########
+
+precipdata<- left_join(firedf, firedat, by='FireYr') %>%
+  group_by(precip_rank_annual,
+           fire_group, cluster) %>%
+  summarize(totalarea = sum(SizeHa),
+            n_fires = n())  %>%
+  mutate(variable= 'precip',
+         rank = as.factor(precip_rank_annual))
+
+
+tempdata<- left_join(firedf, firedat, by='FireYr') %>%
+  group_by(temp_rank_fire,
+           fire_group, cluster) %>%
+  summarize(totalarea = sum(SizeHa),
+            n_fires = n() ) %>% 
+  mutate(variable = 'temp',
+         rank = as.numeric(ifelse(temp_rank_fire ==1, 3,4))) %>%
+  dplyr::arrange(-rank)  %>% 
+  mutate(rank = as.factor(rank))
+
+
+alldat<-bind_rows(precipdata,tempdata)
+alldat$fire_group<-factor(alldat$fire_group, levels=c('small',
+                                                          'medium', 
+                                                          'large',
+                                                          'mega'))
+
+
+label_names <- as_labeller(
+  c("1" = "upland", "2" = "lowland",
+    'temp' ='preceding year\ntemp',
+    'precip' ='preceding year\nprecip' ))
+
+##########
+#### PLOT
+#########
+TOP<- ggplot(alldat %>% drop_na(cluster) %>% filter(variable == "precip"),
+             aes(x=fire_group, y = totalarea,
+                 fill=rank, color=rank))  +
+  geom_bar(position=position_dodge2(width=0.5, preserve = 'single'),width=0.5, stat='identity') + 
+  facet_grid(variable~cluster, switch = "y", labeller =label_names)+
+  xlab('') + ylab('burn area (ha)') +
+  scale_fill_manual(values=c( '#f2ad73','#472151'),
+                    name='precipitation in the\npreceding year',
+                    labels = c('low precip',
+                               'high precip'))+
+  scale_color_manual(values=c('#f2ad73','#472151'),
+                     guide='none')+
+  guides(fill=guide_legend(nrow=4,byrow=FALSE))+
+  scale_y_continuous(labels = scales::label_number_si(), limits=c(0,20000000))+
+  theme_light(base_size=18) + 
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background.y = element_blank(),
+        strip.text.y = element_blank(),
+        strip.background = element_rect(fill="#666f88"),
+        strip.text = element_text(colour = 'white', size=28),
+        plot.margin = unit(c(1,1,0,1),'cm')) 
+
+
+BOTTOM<- ggplot(alldat %>% drop_na(cluster) %>% filter(variable == "temp"),
+                aes(x=fire_group, y = totalarea,
+                    fill=rank, color=rank))  +
+  geom_bar(position=position_dodge2(width=0.5, preserve = 'single'),width=0.5, stat='identity') + 
+  facet_grid(variable~cluster, switch = "y", labeller =label_names)+
+  xlab('Fire size class ') + ylab('burn area (ha)') +
+  scale_fill_manual(values=c( "#355070", "#e56b6f"),
+                    name='temperature in the\npreceding year',
+                    labels = c('low temp',
+                               'high temp'))+
+  scale_color_manual(values=c("#355070", "#e56b6f"),
+                     guide='none')+
+  guides(fill=guide_legend(nrow=4,byrow=FALSE))+
+  scale_y_continuous(labels = scales::label_number_si(), limits=c(0,20000000))+
+  theme_light(base_size=18) + 
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill="#666f88"),
+        strip.text = element_text(colour = 'white', size=28),
+        strip.background.x = element_blank(),
+        strip.background.y = element_blank(),
+        strip.text.y = element_blank(),
+        plot.margin = unit(c(0,1,1,1),'cm')) 
+
+final<-plot_grid(TOP,NULL,BOTTOM, ncol=1, align='v',
+                 rel_heights=c(1,-0.05,1))
+
+
+ggsave("Figure6.jpeg", final,
+       path="figures/",
+       width=120, height=100,units="mm", dpi=500, scale=2.5)
+```
+
+## Table 2
+
+Scaled parameter estimates for trends in regional climate and fire characteristics.
+
+```{r}
+library(tidyverse)
+library(broom)
+library(magrittr)
+
+#############
+##### read in data and define significance cut off
+#############
+
+regionaldat<- read.csv("regional_climate_means.csv")
+firedat<- read.csv("data_with_kmeans.csv")
+
+sigval<-0.05
+
+#############
+##### clean up regional climate data
+#############
+years<-unique(regionaldat$year)
+
+### convert to usable dataframe
+myfun = function(years) {
+  regionaldat %>% subset(year==years) %>%
+    dplyr::select(-c(year)) %>%
+    as.matrix() %>% diag() %>% t() %>%
+    as.data.frame() %>% 
+    set_colnames(names(regionaldat %>% dplyr::select(-year)))%>%
+    mutate(FireYr=years) 
+}
+
+output<-Map(myfun, years) %>% dplyr::bind_rows() 
+
+#############
+##### clean up fire data
+#############
+
+### summarize the number of fires, mean fire size, burned area by year
+dat_regime <- firedat %>% group_by(FireYr) %>% 
+                summarise(num_fires = log(n()),
+                          BA = sqrt(sum(SizeHa)),
+                          size = mean(log(SizeHa)))
+
+
+### annual means of climate variables within fires 
+firemean <- firedat %>% dplyr::select(-c(UniqueId, EcoName, ArcSub)) %>% 
+          group_by(FireYr) %>%
+          summarise(across(everything(), 
+                           .f = list(mean = mean), na.rm = TRUE))
+
+### annual means of climate variables across the study region
+regional_means<-merge(output, dat_regime, by='FireYr', all.x=TRUE)%>% 
+                  dplyr::select(c(vpd_mean, vs_mean, pdsi_mean, def_mean, soil_mean,
+                      tmmx_mean, precip_annual, precip_snowoff, temp_snowoff,
+                       temp_annual, FireYr)) %>%
+                  rename_at(vars(-FireYr),function(x) paste0(x,"_region")) %>%
+                  mutate(soil_mean_region = log(soil_mean_region),
+                         temp_snowoff_region = log(temp_snowoff_region))
+
+### annual means of climate variables within fires combined with 
+### summary of fire statistics
+fire_means<-merge(firemean, dat_regime, by='FireYr', all.x=TRUE) %>% 
+                dplyr::select(c(vpd_mean, wind_mean, pdsi_mean, cwd_mean, soiltemp_mean,
+                         temp_max_mean, precip_annual_mean, precip_snowoff_mean,
+                        temp_annual_mean, FireYr)) %>%
+                rename_at(vars(-FireYr),function(x) paste0(x,"_fire"))
+
+### scale everything
+scaled_means<- merge(merge(regional_means, fire_means, by='FireYr'), 
+                     dat_regime, by='FireYr') %>% 
+              mutate(across(!FireYr, ~ c(scale(.))))
+
+
+#############
+##### linear single variable regressions
+#############
+
+######### REGIONAL TRENDS - WHICH CLIMATE VARIABLES HAVE BEEN INCREASING??
+
+
+regional_trends <- scaled_means %>% dplyr::select(c(precip_annual_region, precip_snowoff_region,
+                                    temp_annual_region, temp_snowoff_region, 
+                                    pdsi_mean_region, vs_mean_region, vpd_mean_region, 
+                                    def_mean_region, tmmx_mean_region,
+                                    soil_mean_region, FireYr))  %>%
+                      gather(variable, value, -FireYr) %>%
+                      nest(data = -variable) %>%
+                              mutate(fit = map(data, ~ lm(value ~ FireYr, data = .x)),
+                                     tidied = map(fit, tidy),
+                                     glanced = map(fit, glance)) %>% 
+                      unnest(tidied, glanced) %>%   
+                      filter(term == "FireYr" & p.value<sigval)  %>% 
+                    dplyr::select(variable, estimate, std.error, p.value, r.squared) %>% 
+                    bind_cols('response'= 'regional trends')
+
+
+######### BURNED AREA, WHICH VARIABLES EXPLAIN INTERANNUAL VAIRATION??
+    
+BA_trends<- scaled_means %>% dplyr::select(c(precip_annual_region, precip_snowoff_region,
+                                             temp_annual_region, temp_snowoff_region, 
+                                             pdsi_mean_region, vs_mean_region, vpd_mean_region, 
+                                             def_mean_region, tmmx_mean_region,
+                                             soil_mean_region, FireYr, BA))  %>% 
+              gather(variable, value, -BA) %>%
+              nest(data = -variable) %>%
+              mutate(fit = map(data, ~ lm(value ~ BA, data = .x)),
+                     tidied = map(fit, tidy),
+                     glanced = map(fit, glance)) %>% 
+              unnest(tidied, glanced) %>%   
+              filter(term == "BA" & p.value<sigval)  %>% 
+              dplyr::select(variable, estimate, std.error, p.value, r.squared)%>% 
+              bind_cols('response'= 'burned area')
+      
+######### NUMBER OF FIRES
+    
+n_trends<- scaled_means %>%  dplyr::select(c(precip_annual_region, precip_snowoff_region,
+                                             temp_annual_region, temp_snowoff_region, 
+                                             pdsi_mean_region, vs_mean_region, vpd_mean_region, 
+                                             def_mean_region, tmmx_mean_region,
+                                             soil_mean_region, FireYr, num_fires)) %>%
+                  gather(variable, value, -num_fires) %>%
+                  nest(data = -variable) %>%
+                  mutate(fit = map(data, ~ lm(value ~ num_fires, data = .x)),
+                         tidied = map(fit, tidy),
+                         glanced = map(fit, glance)) %>% 
+                  unnest(tidied, glanced) %>%   
+                  filter(term == "num_fires" & p.value<sigval)  %>% 
+                  dplyr::select(variable, estimate, std.error, p.value, r.squared)%>% 
+                  bind_cols('response'= 'number of fires')
+                    
+
+######### FIRE SIZE
+    
+size_trends<- scaled_means %>% dplyr::select(c(precip_annual_mean_fire, precip_snowoff_mean_fire,
+                                      temp_annual_mean_fire, vpd_mean_fire, 
+                                      pdsi_mean_fire, cwd_mean_fire, soiltemp_mean_fire, size)) %>%
+                      gather(variable, value, -size) %>%
+                      nest(data = -variable) %>%
+                      mutate(fit = map(data, ~ lm(value ~ size, data = .x)),
+                             tidied = map(fit, tidy),
+                             glanced = map(fit, glance)) %>% 
+                      unnest(tidied, glanced) %>%   
+                      filter(term == "size" & p.value<sigval)  %>% 
+                      dplyr::select(variable, estimate, std.error, p.value, r.squared) %>% 
+                      bind_cols('response'= 'fire size')
+
+
+#############
+##### tidy data for table
+#############    
+    
+    #### put into one dataframe
+        all_metrics<-bind_rows(regional_trends,size_trends,
+                              BA_trends, n_trends) %>%
+                      relocate(response, .before = variable) %>%
+                      mutate(estimate = format(round(estimate,2),nsmall=2),
+                             std.error = format(round(std.error,2),nsmall=2),
+                             p.value = format(round(p.value,2),nsmall=2),
+                             r.squared = format(round(r.squared,2),nsmall=2))
+#############
+##### export table
+############# 
+write.csv(all_metrics,  file = "Table2.csv", row.names = F)
+
+```
+
+## Table 2 - check assumptions
+
+### Regional trends
+
+Check normality and heteroskedasticity assumptions for table 2
+
+```{r}
+#############
+##### check assumptions of normality and heteroskedasticity
+#############
+
+######### REGIONAL TRENDS
+
+regional_fits<- scaled_means %>% dplyr::select(c(precip_annual_region, precip_snowoff_region,
+                                           temp_annual_region, temp_snowoff_region, 
+                                           pdsi_mean_region, vs_mean_region, vpd_mean_region, 
+                                           def_mean_region, tmmx_mean_region,
+                                           soil_mean_region, FireYr, BA)) %>% 
+                gather(variable, value, -BA) %>%
+                nest(data = -variable) %>%
+                mutate(fit = map(data, ~ lm(value ~ BA, data = .x)),
+                       tidied = map(fit, tidy),
+                       glanced = map(fit, glance)) %>% 
+                unnest(tidied, glanced) %>%   
+                filter(term == "BA" & p.value<sigval)  %>% select(fit, variable) 
+
+
+regional_resid_df <- as.data.frame(sapply(regional_fits[[1]], "[[", "residuals")) 
+colnames(regional_resid_df)<-regional_fits$variable
+
+##### check for residual normality
+ggplot(gather(regional_resid_df), aes(value)) + 
+                            geom_histogram(bins = 5, fill='#26453E') + 
+                            facet_wrap(~key, scales = 'free_x') +
+   ggtitle ('Regional trends - normality of residuals') + xlab('' ) + ylab('')
+
+```
+
+```{r}
+##### check for heteroskedasticity
+
+ggplot(gather(regional_resid_df), aes(x=rep(scaled_means$BA, length(regional_fits$variable)), y=value)) + 
+  geom_point(col='purple') + geom_abline(slope = 0)+ 
+  facet_wrap(~key, scales = 'free_x') + 
+  ggtitle ('Regional trends - heteroskedasticity') + xlab('scaled burned area') + ylab('residuals')
+
+```
+
+### Burned area
+
+```{r}
+######### BURNED AREA
+
+BA_fits<- scaled_means %>% dplyr::select(c(precip_annual_region, precip_snowoff_region,
+                                             temp_annual_region, temp_snowoff_region, 
+                                             pdsi_mean_region, vs_mean_region, vpd_mean_region, 
+                                             def_mean_region, tmmx_mean_region,
+                                             soil_mean_region, FireYr, BA)) %>% 
+              gather(variable, value, -BA) %>%
+              nest(data = -variable) %>%
+              mutate(fit = map(data, ~ lm(value ~ BA, data = .x)),
+                     tidied = map(fit, tidy),
+                     glanced = map(fit, glance)) %>% 
+              unnest(tidied, glanced) %>%   
+              filter(term == "BA" & p.value<sigval)  %>% select(fit, variable) 
+
+
+BA_resid_df <- as.data.frame(sapply(BA_fits[[1]], "[[", "residuals")) 
+colnames(BA_resid_df)<-BA_fits$variable
+
+##### check for residual normality
+ggplot(gather(BA_resid_df), aes(value)) + 
+                            geom_histogram(bins = 5, fill='#26453E') + 
+                            facet_wrap(~key, scales = 'free_x') +
+   ggtitle ('Burned area - normality of residuals') + xlab('' ) + ylab('')
+
+```
+
+```{r}
+##### check for heteroskedasticity
+
+ggplot(gather(BA_resid_df), aes(x=rep(scaled_means$BA, length(BA_fits$variable)), y=value)) + 
+  geom_point(col='purple') + geom_abline(slope = 0)+ 
+  facet_wrap(~key, scales = 'free_x') + 
+  ggtitle ('Burned area - heteroskedasticity') + xlab('scaled burned area') + ylab('residuals')
+
+```
+
+### Number of fires
+
+```{r}
+######### NUMBER OF FIRES
+
+n_fits<- scaled_means %>%  dplyr::select(c(precip_annual_region, precip_snowoff_region,
+                                             temp_annual_region, temp_snowoff_region, 
+                                             pdsi_mean_region, vs_mean_region, vpd_mean_region, 
+                                             def_mean_region, tmmx_mean_region,
+                                             soil_mean_region, FireYr, num_fires)) %>%
+                  gather(variable, value, -num_fires) %>%
+                  nest(data = -variable) %>%
+                  mutate(fit = map(data, ~ lm(value ~ num_fires, data = .x)),
+                         tidied = map(fit, tidy),
+                         glanced = map(fit, glance)) %>% 
+                  unnest(tidied, glanced) %>%   
+                  filter(term == "num_fires" & p.value<sigval)  %>% select(fit, variable) 
+
+
+
+n_resid_df <- as.data.frame(sapply(n_fits[[1]], "[[", "residuals")) 
+colnames(n_resid_df)<-n_fits$variable
+
+##### check for residual normality
+ggplot(gather(n_resid_df), aes(value)) + 
+                            geom_histogram(bins = 5, fill='#26453E') + 
+                            facet_wrap(~key, scales = 'free_x') +
+   ggtitle ('Number of fires - normality of residuals') + xlab('' ) + ylab('')
+
+```
+
+```{r}
+##### check for heteroskedasticity
+
+ggplot(gather(n_resid_df), aes(x=rep(scaled_means$BA, length(n_fits$variable)), y=value)) + 
+  geom_point(col='purple') + geom_abline(slope = 0)+ 
+  facet_wrap(~key, scales = 'free_x') + 
+  ggtitle ('Number of fires - heteroskedasticity') + xlab('scaled burned area') + ylab('residuals')
+
+```
+
+### Fire size
+
+```{r}
+######### FIRE SIZE
+
+size_fits<- scaled_means %>% dplyr::select(c(precip_annual_mean_fire, precip_snowoff_mean_fire,
+                                      temp_annual_mean_fire, vpd_mean_fire, 
+                                      pdsi_mean_fire, cwd_mean_fire, soiltemp_mean_fire, size)) %>%
+                      gather(variable, value, -size) %>%
+                      nest(data = -variable) %>%
+                      mutate(fit = map(data, ~ lm(value ~ size, data = .x)),
+                             tidied = map(fit, tidy),
+                             glanced = map(fit, glance)) %>% 
+                      unnest(tidied, glanced) %>%   
+                      filter(term == "size" & p.value<sigval) %>% select(fit, variable) 
+
+
+
+size_resid_df <- as.data.frame(sapply(size_fits[[1]], "[[", "residuals")) 
+colnames(size_resid_df)<-size_fits$variable
+
+##### check for residual normality
+ggplot(gather(size_resid_df), aes(value)) + 
+                            geom_histogram(bins = 5, fill='#26453E') + 
+                            facet_wrap(~key, scales = 'free_x') +
+   ggtitle ('Fire size - normality of residuals') + xlab('' ) + ylab('')
+
+```
+
+```{r}
+##### check for heteroskedasticity
+
+ggplot(gather(size_resid_df), aes(x=rep(scaled_means$BA, length(size_fits$variable)), y=value)) + 
+  geom_point(col='purple') + geom_abline(slope = 0)+ 
+  facet_wrap(~key, scales = 'free_x') + 
+  ggtitle ('Fire size - heteroskedasticity') + xlab('scaled burned area') + ylab('residuals')
+
+```
+
+## Table 3
+
+See 'Cluster analysis' script above
+
+## Supplemental Figure 1
+
+Partial dependence plots of the proportion of water pixels and proportion of larch pixels within the fire perimeter. Figure 4 of the main text excludes water = 0 and larch = 100; this figure presents the full range of the data.
+
+```{r}
+library(tidyverse)
+library(cowplot)
+#############
+##### read in data
+#############
+
+firedat<- read.csv("data/data_with_kmeans.csv")
+partial<- read.csv("data/pd_df.csv")
+
+##########################
+##### PRE-PROCESS % LARCH AND % WATER
+##########################
+
+##########################
+### define plotting function
+##########################
+
+plotfun<- function(histvar, xvar, yvar, colorvar, xlabel) {
+  ### setting up paramaters
+  xhist<-hist(histvar)$breaks
+  yhist<-hist(histvar)$counts
+  ylim.left <- range(yhist)  
+  ylim.right <- range(yvar)  
+  b <- diff(ylim.left)/diff(ylim.right)
+  a <- ylim.left[1] - b*ylim.right[1]
+  
+  plot<-  ggplot() + 
+    geom_histogram(aes(x=histvar), color='grey', fill='grey', alpha=0.6) +
+    geom_line(aes(x=xvar, y=yvar*b +a),size=1.5, color=colorvar) +
+    xlab(xlabel) + 
+    scale_y_continuous("frequency", 
+                       sec.axis =   sec_axis(~ (. - a)/b, name='marginal impact\non fire size')) +
+    theme_light(base_size=24) + 
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line.y.right = element_line(color = colorvar), 
+          axis.ticks.y.right = element_line(color = colorvar),
+          axis.text.y.right = element_text(color = colorvar), 
+          axis.title.y.right = element_text(color = colorvar),
+          legend.position = 'none')
+  
+  plot 
+}
+
+##########################
+### plot variables
+##########################
+
+###landscape variables
+waterplot<-plotfun(firedat$water_percent, partial$water_x, partial$water_y, '#428198', 'proportion of water pixels\nin fire perimeter')
+larchplot<-plotfun(firedat$larch_percent, partial$larch_x, partial$larch_y, '#b0a171', 'proportion of larch pixels\nin fire perimeter')
+
+
+finalplot<-plot_grid(waterplot,
+                     larchplot, 
+                     nrow=1, ncol=2)
+
+ggsave("partialdependence_suppmat.jpeg", finalplot,
+       path="figures/",
+       width=120, height=100,units="mm", dpi=500, scale=2.5)
+
+##https://stackoverflow.com/questions/3099219/ggplot-with-2-y-axes-on-each-side-and-different-scales
+```
